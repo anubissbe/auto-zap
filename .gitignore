@@ -24,3 +24,6 @@ Desktop.ini
 # Temp
 *.tmp
 nul
+
+# Generator scripts (not needed by users)
+generate_*.py
