@@ -27,3 +27,8 @@ nul
 
 # Generator scripts (not needed by users)
 generate_*.py
+
+# Build artifacts
+build/staging/
+build/*.pfx
+dist/
