@@ -29,9 +29,12 @@ Drop into any web app directory, run `.\auto-zap.ps1`, and get a complete vulner
 
 ### Windows Installer (recommended)
 
-Download the latest installer from the [GitHub Releases](https://github.com/bert-euraika/auto-zap/releases/latest) page:
+Download from the [GitHub Releases](https://github.com/bert-euraika/auto-zap/releases/latest) page:
 
-**[Download Auto-ZAP-Setup.exe (v1.0.0)](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.0/Auto-ZAP-Setup.exe)** (~112 MB)
+| Download | Size | Description |
+|----------|------|-------------|
+| **[Auto-ZAP-Setup.exe](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.0/Auto-ZAP-Setup.exe)** | ~112 MB | Full installer with bundled ZAP + Java |
+| **[auto-zap.ps1](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.0/auto-zap.ps1)** | ~100 KB | Standalone script (requires ZAP + Java installed separately) |
 
 The installer bundles everything you need:
 - `auto-zap.ps1` - The scanner script
