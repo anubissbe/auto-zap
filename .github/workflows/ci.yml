@@ -308,7 +308,7 @@ jobs:
       - name: Check required files exist
         run: |
           ERRORS=0
-          for f in auto-zap.ps1 auto-zap.sh action.yml README.md LICENSE.txt \
+          for f in auto-zap.ps1 auto-zap.sh action.yml README.md LICENSE \
                    build/build.ps1 build/installer.nsi \
                    .github/workflows/security-scan.yml .github/workflows/ci.yml; do
             if [[ -f "$f" ]]; then
