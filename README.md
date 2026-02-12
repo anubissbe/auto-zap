@@ -33,10 +33,10 @@ Download from the [GitHub Releases](https://github.com/bert-euraika/auto-zap/rel
 
 | Download | Size | Description |
 |----------|------|-------------|
-| **[Auto-ZAP-Setup.exe](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.0/Auto-ZAP-Setup.exe)** | ~112 MB | Full installer with bundled ZAP + Java |
-| **[auto-zap.ps1](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.0/auto-zap.ps1)** | ~100 KB | Standalone script (requires ZAP + Java installed separately) |
-| **[Auto-ZAP-Presentation.pptx](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.0/Auto-ZAP-Presentation.pptx)** | | Project overview slide deck (10 slides) |
-| **[Auto-ZAP-Technical-Specification.docx](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.0/Auto-ZAP-Technical-Specification.docx)** | | Technical specification document |
+| **[Auto-ZAP-Setup.exe](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.1/Auto-ZAP-Setup.exe)** | ~112 MB | Full installer with bundled ZAP + Java |
+| **[auto-zap.ps1](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.1/auto-zap.ps1)** | ~100 KB | Standalone script (requires ZAP + Java installed separately) |
+| **[Auto-ZAP-Presentation.pptx](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.1/Auto-ZAP-Presentation.pptx)** | | Project overview slide deck (10 slides) |
+| **[Auto-ZAP-Technical-Specification.docx](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.1/Auto-ZAP-Technical-Specification.docx)** | | Technical specification document |
 
 The installer bundles everything you need:
 - `auto-zap.ps1` - The scanner script
