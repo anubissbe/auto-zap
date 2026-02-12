@@ -1,5 +1,5 @@
 name: 'Auto-ZAP Security Scanner'
-description: 'Automated OWASP ZAP security scanning for web applications. Zero-config framework detection, Docker-based ZAP on Linux, native ZAP on Windows.'
+description: 'Zero-config OWASP ZAP security scanner. Auto-detects 30+ frameworks, databases, and auth.'
 author: 'bert-euraika'
 
 branding:
