@@ -76,9 +76,9 @@ for test_def in "${TESTS[@]}"; do
 
     # Run auto-zap.sh with a 30s timeout - enough for detection + start of install
     # It will likely fail or timeout during install/start, which is fine
-    cd "$test_dir"
+    cd "$test_dir" || return 1
     timeout 30 bash "$AUTO_ZAP" > "$log_file" 2>&1 || true
-    cd "$SCRIPT_DIR"
+    cd "$SCRIPT_DIR" || return 1
 
     # Check detection
     detected=$(grep -o 'Detected: .*' "$log_file" 2>/dev/null | head -1 | sed 's/Detected: //')
