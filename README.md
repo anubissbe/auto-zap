@@ -8,6 +8,7 @@ Drop into any web app directory, run `.\auto-zap.ps1`, and get a complete vulner
 
 ## Table of Contents
 
+- [Installation](#installation)
 - [Quick Start](#quick-start)
 - [What It Does](#what-it-does)
 - [Supported Frameworks](#supported-frameworks)
@@ -21,6 +22,54 @@ Drop into any web app directory, run `.\auto-zap.ps1`, and get a complete vulner
 - [Parallel Scans](#parallel-scans)
 - [Prerequisites](#prerequisites)
 - [Troubleshooting](#troubleshooting)
+
+---
+
+## Installation
+
+### Windows Installer (recommended)
+
+Download the latest installer from the [GitHub Releases](https://github.com/bert-euraika/auto-zap/releases/latest) page:
+
+**[Download Auto-ZAP-Setup.exe (v1.0.0)](https://github.com/bert-euraika/auto-zap/releases/download/v1.0.0/Auto-ZAP-Setup.exe)** (~112 MB)
+
+The installer bundles everything you need:
+- `auto-zap.ps1` - The scanner script
+- **OWASP ZAP 2.16.1** - Vulnerability scanner
+- **Eclipse Temurin JRE 17** - Java runtime
+
+Run the installer as Administrator. After installation, `auto-zap.cmd` is available from any directory (added to system PATH).
+
+> **Note:** The installer is signed with a self-signed certificate. Windows may show "Unknown publisher" - click "Run anyway" to proceed.
+
+### Manual Installation
+
+If you prefer not to use the installer:
+
+```powershell
+# Clone the repo
+git clone https://github.com/bert-euraika/auto-zap.git
+cd auto-zap
+
+# Install ZAP and Java separately
+winget install ZAP.ZAP
+winget install EclipseAdoptium.Temurin.17.JRE
+
+# Run from the repo directory
+.\auto-zap.ps1
+```
+
+### Building the Installer from Source
+
+```powershell
+# Prerequisites: NSIS (winget install NSIS.NSIS)
+cd build
+.\build.ps1                  # Downloads ZAP + JRE, builds & signs installer
+.\build.ps1 -SkipDownload    # Rebuild using cached downloads
+.\build.ps1 -SkipSign        # Build without code signing
+```
+
+The installer will be output to `dist/Auto-ZAP-Setup.exe`.
 
 ---
 
@@ -574,7 +623,10 @@ cd C:\projects\app2
 
 ## Prerequisites
 
+> **Easiest option:** Use the [Windows installer](#installation) - it bundles ZAP and Java, no separate installs needed.
+
 ### Required (one of)
+- **Auto-ZAP Installer** - Includes everything ([download](https://github.com/bert-euraika/auto-zap/releases/latest))
 - **OWASP ZAP** (local install) + **Java 17+**
   ```
   winget install ZAP.ZAP
@@ -684,4 +736,8 @@ Auto-ZAP is a single PowerShell script (~3,140 lines) with zero external depende
 
 ## License
 
-This project is provided as-is for security testing purposes. Use responsibly and only on applications you have permission to test.
+MIT License - see [LICENSE.txt](LICENSE.txt).
+
+This project bundles [OWASP ZAP](https://www.zaproxy.org/) (Apache 2.0) and [Eclipse Temurin JRE 17](https://adoptium.net/) (GPLv2 with Classpath Exception) in the installer.
+
+Use responsibly and only on applications you have permission to test.
