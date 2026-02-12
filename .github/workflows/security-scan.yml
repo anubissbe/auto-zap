@@ -42,7 +42,7 @@ jobs:
         if: hashFiles('**/requirements.txt', '**/pyproject.toml', '**/Pipfile') != ''
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.14'
 
       - name: Setup .NET
         if: hashFiles('**/*.csproj', '**/*.sln') != ''
