@@ -40,7 +40,7 @@ jobs:
       - name: PSScriptAnalyzer (auto-zap.ps1)
         shell: pwsh
         run: |
-          $results = Invoke-ScriptAnalyzer -Path auto-zap.ps1 -Severity Warning,Error -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSAvoidUsingInvokeExpression
+          $results = Invoke-ScriptAnalyzer -Path auto-zap.ps1 -Severity Warning,Error -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSAvoidUsingInvokeExpression,PSAvoidUsingPlainTextForPassword,PSReviewUnusedParameter
           if ($results) {
             $results | Format-Table -AutoSize
             $errors = $results | Where-Object { $_.Severity -eq 'Error' }

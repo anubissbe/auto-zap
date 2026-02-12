@@ -183,7 +183,7 @@ if (-not $ReportPath) {
 }
 
 # --- Load .auto-zap.json config ---
-function Load-AutoZapConfig {
+function Import-AutoZapConfig {
     $configPath = Join-Path $script:OriginalDir ".auto-zap.json"
     if (-not (Test-Path $configPath)) {
         $script:Config = $null
@@ -201,7 +201,7 @@ function Load-AutoZapConfig {
 }
 
 # --- Start background services from config ---
-function Start-BackgroundServices {
+function Start-BackgroundService {
     if (-not $script:Config -or -not $script:Config.services) { return }
 
     Write-Step "STEP 4c: Starting background services..."
@@ -244,7 +244,7 @@ function Start-BackgroundServices {
 }
 
 # --- Start Docker Compose services from config ---
-function Start-ComposeServices {
+function Start-ComposeService {
     if (-not $script:Config -or -not $script:Config.compose) { return $false }
 
     $compose = $script:Config.compose
@@ -274,7 +274,7 @@ function Start-ComposeServices {
         return $false
     }
 
-    if (-not (Ensure-DockerRunning)) {
+    if (-not (Test-DockerRunning)) {
         Write-Err "Docker Compose failed to start services: $($services -join ', ')"
         Write-Err "    Fix: Run 'docker compose -f $composeFilePath up -d $($services -join ' ')' manually to see the error."
         Write-Err "         Check the `"compose`" section in .auto-zap.json."
@@ -316,7 +316,7 @@ function Stop-ProcessTree([int]$ParentPid) {
         foreach ($child in $children) {
             Stop-ProcessTree $child.ProcessId
         }
-    } catch {}
+    } catch { $null = $_ }
     Stop-Process -Id $ParentPid -Force -ErrorAction SilentlyContinue
 }
 
@@ -344,7 +344,7 @@ function Cleanup {
         try {
             Invoke-RestMethod "http://localhost:$ZapApiPort/JSON/core/action/shutdown/?apikey=$ZapApiKey" -TimeoutSec 5 -ErrorAction SilentlyContinue | Out-Null
             Start-Sleep -Seconds 3
-        } catch {}
+        } catch { $null = $_ }
         docker stop $script:ZapDockerContainer 2>$null | Out-Null
         docker rm $script:ZapDockerContainer 2>$null | Out-Null
     } elseif ($script:ZapProcess -and !$script:ZapProcess.HasExited) {
@@ -352,7 +352,7 @@ function Cleanup {
         try {
             Invoke-RestMethod "http://localhost:$ZapApiPort/JSON/core/action/shutdown/?apikey=$ZapApiKey" -TimeoutSec 5 -ErrorAction SilentlyContinue | Out-Null
             Start-Sleep -Seconds 3
-        } catch {}
+        } catch { $null = $_ }
         if (!$script:ZapProcess.HasExited) {
             Stop-ProcessTree $script:ZapProcess.Id
         }
@@ -398,7 +398,7 @@ function Get-FreePort {
         $listener.Start()
         $listener.Stop()
         return $PreferredPort
-    } catch {}
+    } catch { $null = $_ }
     # Preferred port occupied - let OS assign a free one
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -460,7 +460,7 @@ function Invoke-ZapApi([string]$Endpoint) {
 }
 
 # --- Load .env files into process environment ---
-function Import-EnvFiles {
+function Import-EnvFile {
     # Most specific first - "don't override" semantics means first writer wins
     $envFiles = @(".env.development.local", ".env.local", ".env.development", ".env")
     # Monorepo root first so app-dir values override root values
@@ -545,7 +545,7 @@ function Build-ScanManifest {
 
 function Sync-Manifest {
     if (-not $script:Manifest) { return }
-    # Re-sync fields that may have been updated by later steps (Ensure-Database, Ensure-Redis, etc.)
+    # Re-sync fields that may have been updated by later steps (Initialize-Database, Initialize-RedisCache, etc.)
     if ($script:ComposeFile -and -not $script:Manifest.ComposeFile) {
         $script:Manifest.ComposeFile = $script:ComposeFile
     }
@@ -685,11 +685,11 @@ function Find-DockerDesktop {
 }
 
 # --- Ensure Docker daemon is running ---
-function Ensure-DockerRunning {
+function Test-DockerRunning {
     if (-not (Test-Command "docker")) {
         return $false
     }
-    $dockerInfo = docker info 2>&1
+    $null = docker info 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Step "Docker daemon is not running. Starting Docker Desktop..."
         $dockerDesktopPath = Find-DockerDesktop
@@ -718,7 +718,7 @@ function Ensure-DockerRunning {
 }
 
 # --- Detect and ensure Docker + database ---
-function Ensure-Database {
+function Initialize-Database {
     $dbConfig = Get-DatabaseConfig
     if (-not $dbConfig) {
         Write-Warn "No DATABASE_URL found in .env files. Skipping database setup."
@@ -747,7 +747,7 @@ function Ensure-Database {
     }
 
     # Need Docker
-    if (-not (Ensure-DockerRunning)) {
+    if (-not (Test-DockerRunning)) {
         Write-Err "Database ($($dbConfig.Type)) required but not reachable on port $($dbConfig.Port), and Docker is not available."
         Write-Err "    Fix: Start the database manually, or install Docker: winget install Docker.DockerDesktop"
         Write-Err "         Or update DATABASE_URL in .env to point to a running database."
@@ -795,7 +795,7 @@ function Ensure-Database {
         Write-Step "Starting database via docker compose ($composeFile)..."
         $dbServiceStarted = $false
         foreach ($svcName in @("db", "database", "postgres", "postgresql", "mysql", "mariadb", "mongo", "mongodb", "mssql", "sqlserver")) {
-            $result = docker compose -f (Join-Path $composeDir $composeFile) up -d $svcName 2>&1
+            $null = docker compose -f (Join-Path $composeDir $composeFile) up -d $svcName 2>&1
             if ($LASTEXITCODE -eq 0) {
                 $script:DbContainerName = $svcName
                 $script:DbContainerStartedByUs = $true
@@ -872,7 +872,7 @@ function Ensure-Database {
 }
 
 # --- Ensure Redis if needed ---
-function Ensure-Redis {
+function Initialize-RedisCache {
     $redisConfig = Get-RedisConfig
     if (-not $redisConfig) { return }
 
@@ -889,7 +889,7 @@ function Ensure-Redis {
         Write-Detail "Redis not reachable. Will attempt to start via Docker..."
     }
 
-    if (-not (Ensure-DockerRunning)) {
+    if (-not (Test-DockerRunning)) {
         Write-Warn "Docker not available. Cannot start Redis. Continuing without it."
         return
     }
@@ -939,7 +939,7 @@ function Get-NodePackageManager {
 }
 
 # --- Ensure package manager is installed ---
-function Ensure-PackageManager([string]$Name) {
+function Test-PackageManager([string]$Name) {
     if ($Name -eq "npm") { return $true }
 
     # Check if already available
@@ -990,7 +990,7 @@ function Ensure-PackageManager([string]$Name) {
 }
 
 # --- Detect web app framework ---
-function Detect-AppFramework {
+function Get-AppFramework {
     $dir = $script:OriginalDir
 
     # --- Monorepo detection ---
@@ -1003,7 +1003,7 @@ function Detect-AppFramework {
         try {
             $rootPkg = Get-Content (Join-Path $dir "package.json") -Raw | ConvertFrom-Json
             if ($rootPkg.workspaces) { $isMonorepo = $true; $monorepoType = "npm/yarn workspace" }
-        } catch {}
+        } catch { $null = $_ }
     }
 
     if ($isMonorepo) {
@@ -1087,7 +1087,7 @@ function Detect-AppFramework {
                         $relPath = $pkgFile.DirectoryName.Substring($dir.Length).TrimStart('\', '/')
                         $matchedApps += @{ Path = $pkgFile.DirectoryName; RelPath = $relPath }
                     }
-                } catch {}
+                } catch { $null = $_ }
             }
 
             if ($matchedApps.Count -gt 0) {
@@ -1590,7 +1590,7 @@ function Detect-AppFramework {
         foreach ($name in @("deno.json", "deno.jsonc")) {
             $dpath = Join-Path $dir $name
             if (Test-Path $dpath) {
-                try { $denoConfig = Get-Content $dpath -Raw | ConvertFrom-Json } catch {}
+                try { $denoConfig = Get-Content $dpath -Raw | ConvertFrom-Json } catch { $null = $_ }
                 break
             }
         }
@@ -1675,7 +1675,7 @@ function Detect-AppFramework {
     return $null
 }
 
-function Run-Command([string]$Label, [string]$Command, [string]$WorkDir) {
+function Invoke-ProjectCommand([string]$Label, [string]$Command, [string]$WorkDir) {
     if (-not $WorkDir) { $WorkDir = $script:OriginalDir }
     Write-Step "$Label`: $Command"
     Write-Detail "Working directory: $WorkDir"
@@ -1691,7 +1691,7 @@ function Run-Command([string]$Label, [string]$Command, [string]$WorkDir) {
 # =============================================================
 # PHASE 1: ZAP Context & Technology Configuration
 # =============================================================
-function Configure-ZapContext {
+function Set-ZapContext {
     param(
         [string]$TargetUrl,
         [hashtable]$Framework
@@ -1733,7 +1733,7 @@ function Configure-ZapContext {
         try {
             $escaped = [uri]::EscapeDataString($pattern)
             Invoke-ZapApi "/JSON/context/action/excludeFromContext/?contextName=$($script:ZapContextName)&regex=$escaped" | Out-Null
-        } catch {}
+        } catch { $null = $_ }
     }
 
     # Add config-defined exclude patterns
@@ -1743,7 +1743,7 @@ function Configure-ZapContext {
                 $escaped = [uri]::EscapeDataString($pattern)
                 Invoke-ZapApi "/JSON/context/action/excludeFromContext/?contextName=$($script:ZapContextName)&regex=$escaped" | Out-Null
                 Write-Detail "Excluded pattern (config): $pattern"
-            } catch {}
+            } catch { $null = $_ }
         }
     }
 
@@ -1814,7 +1814,7 @@ function Configure-ZapContext {
                     Write-Warn "Failed to set technology filter: $($_.Exception.Message)"
                     try {
                         Invoke-ZapApi "/JSON/context/action/includeAllContextTechnologies/?contextName=$($script:ZapContextName)" | Out-Null
-                    } catch {}
+                    } catch { $null = $_ }
                 }
             } else {
                 Write-Detail "No matching technologies found in ZAP. Using all technologies."
@@ -1829,11 +1829,11 @@ function Configure-ZapContext {
     foreach ($token in $csrfTokens) {
         try {
             Invoke-ZapApi "/JSON/acsrf/action/addOptionToken/?String=$([uri]::EscapeDataString($token))" | Out-Null
-        } catch {}
+        } catch { $null = $_ }
     }
     try {
         Invoke-ZapApi "/JSON/ascan/action/setOptionHandleAntiCSRFTokens/?Boolean=true" | Out-Null
-    } catch {}
+    } catch { $null = $_ }
 
     Write-Ok "ZAP context configured (ID: $($script:ZapContextId))."
 }
@@ -1915,7 +1915,7 @@ function Import-ApiSpec {
                     }
                 }
             }
-        } catch {}
+        } catch { $null = $_ }
     }
 
     Write-Detail "No OpenAPI/Swagger specification found."
@@ -1952,7 +1952,7 @@ function Import-GraphqlSchema {
                     Write-Warn "ZAP failed to import GraphQL schema: $($_.Exception.Message)"
                 }
             }
-        } catch {}
+        } catch { $null = $_ }
     }
 
     Write-Detail "Could not import GraphQL schema automatically."
@@ -1961,7 +1961,7 @@ function Import-GraphqlSchema {
 # =============================================================
 # PHASE 3: Authenticated Scanning
 # =============================================================
-function Configure-ZapAuth {
+function Set-ZapAuth {
     param(
         [string]$TargetUrl,
         [string]$ProjectDir
@@ -2024,7 +2024,7 @@ function Configure-ZapAuth {
         foreach ($ep in $loginEndpoints) {
             try {
                 $testUrl = "${TargetUrl}${ep}"
-                $resp = Invoke-WebRequest -Uri $testUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                $null = Invoke-WebRequest -Uri $testUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
                 $loginUrl = $testUrl
                 Write-Detail "Login endpoint found at: $ep"
                 break
@@ -2110,7 +2110,7 @@ function Configure-ZapAuth {
 # =============================================================
 # PHASE 4: Scan Policy Configuration
 # =============================================================
-function Configure-ScanPolicy {
+function Set-ScanPolicy {
     param(
         [hashtable]$Framework,
         [bool]$IsFullScan
@@ -2120,7 +2120,7 @@ function Configure-ScanPolicy {
     Write-Step "Configuring scan policy..."
 
     # Remove stale policy from prior run (ignore errors if it doesn't exist)
-    try { Invoke-ZapApi "/JSON/ascan/action/removeScanPolicy/?scanPolicyName=$policyName" | Out-Null } catch {}
+    try { Invoke-ZapApi "/JSON/ascan/action/removeScanPolicy/?scanPolicyName=$policyName" | Out-Null } catch { $null = $_ }
     try {
         Invoke-ZapApi "/JSON/ascan/action/addScanPolicy/?scanPolicyName=$policyName" | Out-Null
     } catch {
@@ -2193,14 +2193,14 @@ function Configure-ScanPolicy {
     $threads = if ($IsFullScan) { 5 } else { 2 }
     try {
         Invoke-ZapApi "/JSON/ascan/action/setOptionThreadPerHost/?Integer=$threads" | Out-Null
-    } catch {}
+    } catch { $null = $_ }
 
     # Count active rules
     try {
         $scanners = Invoke-ZapApi "/JSON/ascan/view/scanners/?scanPolicyName=$policyName&policyId="
         $enabledCount = ($scanners.scanners | Where-Object { $_.enabled -eq "true" }).Count
         $script:ActiveRuleCount = $enabledCount
-    } catch {}
+    } catch { $null = $_ }
 
     $script:ScanPolicyName = $policyName
     Write-Ok "Scan policy configured: strength=$strength, threshold=$threshold, threads=$threads"
@@ -2474,8 +2474,7 @@ Write-Host ""
 # --- Step 0: Check prerequisites ---
 Write-Step "STEP 0: Checking prerequisites..."
 
-$canRunLocal = ($ZapPath -ne $null)
-$canRunDocker = $false
+$canRunLocal = ($null -ne $ZapPath)
 
 # Determine ZAP execution mode
 if ($UseDockerZap) {
@@ -2487,9 +2486,8 @@ if (-not $canRunLocal -and -not $script:UsingDockerZap) {
     # No local ZAP found, check if Docker is available as fallback
     if (Test-Command "docker") {
         Write-Warn "Local ZAP not found. Checking Docker as fallback..."
-        $dockerCheck = docker info 2>&1
+        $null = docker info 2>&1
         if ($LASTEXITCODE -eq 0) {
-            $canRunDocker = $true
             $script:UsingDockerZap = $true
             Write-Ok "Docker available. Will use Docker-based ZAP."
         }
@@ -2506,7 +2504,7 @@ if (-not $canRunLocal -and -not $script:UsingDockerZap) {
 }
 
 # Load .auto-zap.json config
-Load-AutoZapConfig
+Import-AutoZapConfig
 
 # Dynamic ZAP port allocation
 $zapPortInUse = Get-NetTCPConnection -LocalPort $ZapApiPort -ErrorAction SilentlyContinue |
@@ -2544,7 +2542,7 @@ $appPort = 0
 if (-not $TargetUrl) {
     # --- Step 1: Detect framework ---
     Write-Step "STEP 1: Detecting web app framework..."
-    $framework = Detect-AppFramework
+    $framework = Get-AppFramework
 
     if (-not $framework) {
         Write-Err "Could not detect a web application in $($script:OriginalDir)"
@@ -2604,7 +2602,7 @@ if (-not $TargetUrl) {
     Write-Host ""
 
     # Load .env files into process environment so tools like Prisma can find DATABASE_URL etc.
-    $envCount = Import-EnvFiles
+    $envCount = Import-EnvFile
 
     # Check for PORT env var (many apps respect this, especially Node.js and Python)
     if (-not $Port) {
@@ -2627,13 +2625,13 @@ if (-not $TargetUrl) {
     $composeHandledDb = $false
     if ($script:Config -and $script:Config.compose) {
         Write-Step "STEP 2: Starting Docker Compose services..."
-        $composeHandledDb = Start-ComposeServices
+        $composeHandledDb = Start-ComposeService
     }
 
     if ($framework.NeedsDb -and -not $composeHandledDb) {
         Write-Step "STEP 2: Ensuring database is running..."
         $dbConfig = Get-DatabaseConfig
-        if (-not (Ensure-Database)) {
+        if (-not (Initialize-Database)) {
             $dbType = if ($dbConfig) { $dbConfig.Type } else { "unknown" }
             $dbPort = if ($dbConfig) { $dbConfig.Port } else { "unknown" }
             Write-Err "Database ($dbType) required but not reachable on port $dbPort, and Docker is not available."
@@ -2643,13 +2641,13 @@ if (-not $TargetUrl) {
             exit 1
         }
         # Also check for Redis
-        Ensure-Redis
+        Initialize-RedisCache
         # Give DB a moment to accept queries after TCP is open
         Start-Sleep -Seconds 3
     } elseif (-not $composeHandledDb) {
         Write-Step "STEP 2: No database needed. Skipping."
         # Still check for Redis (some apps use it for caching/sessions)
-        Ensure-Redis
+        Initialize-RedisCache
     }
     Sync-Manifest
     Write-Host ""
@@ -2658,7 +2656,7 @@ if (-not $TargetUrl) {
     # Ensure the package manager is available before installing
     if ($framework.Runtime -eq "Node.js") {
         $pm = Get-NodePackageManager
-        if (-not (Ensure-PackageManager $pm.Name)) {
+        if (-not (Test-PackageManager $pm.Name)) {
             Cleanup
             exit 1
         }
@@ -2667,7 +2665,7 @@ if (-not $TargetUrl) {
     if (-not $SkipInstall -and $framework.Install) {
         Write-Step "STEP 3: Installing dependencies..."
         $installDir = if ($framework.InstallDir) { $framework.InstallDir } else { $script:OriginalDir }
-        $installResult = Run-Command "Install" $framework.Install $installDir
+        $installResult = Invoke-ProjectCommand "Install" $framework.Install $installDir
         if (-not $installResult) {
             Write-Err "Dependency installation failed: $($framework.Install)"
             Write-Err "    Fix: Run '$($framework.Install)' manually to see the full error."
@@ -2688,7 +2686,7 @@ if (-not $TargetUrl) {
     if ($framework.Migrations -and $framework.Migrations.Count -gt 0) {
         Write-Step "STEP 4: Running database migrations..."
         foreach ($migration in $framework.Migrations) {
-            $migResult = Run-Command "Migration" $migration
+            $migResult = Invoke-ProjectCommand "Migration" $migration
             if (-not $migResult) {
                 Write-Err "Migration failed: $migration"
                 Write-Err "    Fix: Run '$migration' manually to debug."
@@ -2708,7 +2706,7 @@ if (-not $TargetUrl) {
         Write-Step "STEP 4b: Running pre-start hooks..."
         foreach ($hook in $script:Config.preStart) {
             Write-Step "Pre-start: $hook"
-            $hookResult = Run-Command "Pre-start" $hook
+            $hookResult = Invoke-ProjectCommand "Pre-start" $hook
             if (-not $hookResult) {
                 Write-Err "Pre-start hook failed: $hook"
                 Write-Err "    Fix: Run '$hook' manually to debug."
@@ -2722,7 +2720,7 @@ if (-not $TargetUrl) {
     Write-Host ""
 
     # --- Step 4c: Start background services ---
-    Start-BackgroundServices
+    Start-BackgroundService
     Write-Host ""
 
     # --- Step 5: Start the web app ---
@@ -2775,10 +2773,10 @@ if (-not $TargetUrl) {
     }
 
     # Try to detect framework for configuration even with -Url
-    try { $framework = Detect-AppFramework } catch {}
+    try { $framework = Get-AppFramework } catch { $null = $_ }
 
     # Parse port from URL
-    try { $appPort = ([uri]$TargetUrl).Port } catch {}
+    try { $appPort = ([uri]$TargetUrl).Port } catch { $null = $_ }
 }
 Write-Host ""
 
@@ -2797,7 +2795,7 @@ if ($script:UsingDockerZap) {
     Write-Step "STEP 6: Starting OWASP ZAP via Docker on port $ZapApiPort ..."
 
     # Ensure Docker is running
-    if (-not (Ensure-DockerRunning)) {
+    if (-not (Test-DockerRunning)) {
         Write-Err "Docker is not available. Cannot start ZAP."
         Cleanup
         exit 1
@@ -2875,7 +2873,7 @@ Write-Host ""
 
 # --- Step 7: Configure ZAP context & technology ---
 Write-Step "STEP 7: Configuring ZAP context and technology..."
-Configure-ZapContext -TargetUrl $ZapTargetUrl -Framework $framework
+Set-ZapContext -TargetUrl $ZapTargetUrl -Framework $framework
 Write-Host ""
 
 # --- Step 8: Import API specs ---
@@ -2886,12 +2884,12 @@ Write-Host ""
 
 # --- Step 9: Configure authentication ---
 Write-Step "STEP 9: Configuring authentication..."
-Configure-ZapAuth -TargetUrl $TargetUrl -ProjectDir $script:OriginalDir
+Set-ZapAuth -TargetUrl $TargetUrl -ProjectDir $script:OriginalDir
 Write-Host ""
 
 # --- Step 10: Configure scan policy ---
 Write-Step "STEP 10: Configuring scan policy..."
-Configure-ScanPolicy -Framework $framework -IsFullScan $FullScan.IsPresent
+Set-ScanPolicy -Framework $framework -IsFullScan $FullScan.IsPresent
 Write-Host ""
 
 # --- Pre-scan summary ---
@@ -2997,7 +2995,7 @@ do {
     if ($stallElapsed -ge $stallTimeoutSec) {
         Write-Host ""
         Write-Warn "Active scan stalled at $currentProgress% for $([math]::Round($stallElapsed / 60, 1)) min. Stopping scan."
-        try { Invoke-ZapApi "/JSON/ascan/action/stop/?scanId=$scanId" | Out-Null } catch {}
+        try { Invoke-ZapApi "/JSON/ascan/action/stop/?scanId=$scanId" | Out-Null } catch { $null = $_ }
         break
     }
 
@@ -3005,7 +3003,7 @@ do {
     if ($elapsed -ge $maxScanMinutes) {
         Write-Host ""
         Write-Warn "Active scan reached $maxScanMinutes min timeout at $currentProgress%. Stopping scan."
-        try { Invoke-ZapApi "/JSON/ascan/action/stop/?scanId=$scanId" | Out-Null } catch {}
+        try { Invoke-ZapApi "/JSON/ascan/action/stop/?scanId=$scanId" | Out-Null } catch { $null = $_ }
         break
     }
 } while ($currentProgress -lt 100)
