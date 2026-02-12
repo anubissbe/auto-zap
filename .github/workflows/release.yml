@@ -1,0 +1,120 @@
+name: Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================
+  # Job 1: Run CI gate (reuse existing checks)
+  # ============================================================
+  ci:
+    name: CI Gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # ============================================================
+  # Job 2: Build the Windows installer
+  # ============================================================
+  build:
+    name: Build Installer
+    runs-on: windows-latest
+    needs: ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install NSIS
+        run: choco install nsis -y
+
+      - name: Download OWASP ZAP
+        shell: pwsh
+        run: |
+          $zapUrl = "https://github.com/zaproxy/zaproxy/releases/download/v2.16.1/ZAP_2.16.1_Core.zip"
+          $zapZip = "build/staging/zap.zip"
+          New-Item -ItemType Directory -Path "build/staging/zap" -Force | Out-Null
+          Write-Host "Downloading ZAP from $zapUrl ..."
+          Invoke-WebRequest -Uri $zapUrl -OutFile $zapZip -UseBasicParsing
+          Write-Host "Extracting ZAP..."
+          Expand-Archive -Path $zapZip -DestinationPath "build/staging" -Force
+          $zapSubDir = Get-ChildItem "build/staging" -Directory | Where-Object { $_.Name -match "^ZAP" } | Select-Object -First 1
+          if ($zapSubDir) {
+            Get-ChildItem $zapSubDir.FullName | Move-Item -Destination "build/staging/zap" -Force
+            Remove-Item $zapSubDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "ZAP extracted to build/staging/zap"
+
+      - name: Download Eclipse Temurin JRE 17
+        shell: pwsh
+        run: |
+          $jreUrl = "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jre/hotspot/normal/eclipse?project=jdk"
+          $jreZip = "build/staging/jre.zip"
+          New-Item -ItemType Directory -Path "build/staging/jre" -Force | Out-Null
+          Write-Host "Downloading Temurin JRE 17..."
+          Invoke-WebRequest -Uri $jreUrl -OutFile $jreZip -UseBasicParsing
+          Write-Host "Extracting JRE..."
+          Expand-Archive -Path $jreZip -DestinationPath "build/staging" -Force
+          $jreSubDir = Get-ChildItem "build/staging" -Directory | Where-Object { $_.Name -match "^jdk-17" } | Select-Object -First 1
+          if ($jreSubDir) {
+            Get-ChildItem $jreSubDir.FullName | Move-Item -Destination "build/staging/jre" -Force
+            Remove-Item $jreSubDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "JRE extracted to build/staging/jre"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          cd build
+          .\build.ps1 -SkipDownload -SkipSign
+
+      - name: Verify installer
+        shell: pwsh
+        run: |
+          $exe = "dist/Auto-ZAP-Setup.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Installer not found at $exe"
+            exit 1
+          }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "Installer built: $exe ($size MB)"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: installer
+          path: dist/Auto-ZAP-Setup.exe
+          retention-days: 1
+
+  # ============================================================
+  # Job 3: Create GitHub Release and upload assets
+  # ============================================================
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download installer artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: installer
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/Auto-ZAP-Setup.exe
+            auto-zap.ps1
+            auto-zap.sh
+            action.yml
+            Auto-ZAP-Presentation.pptx
+            Auto-ZAP-Technical-Specification.docx
