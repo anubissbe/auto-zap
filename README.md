@@ -20,6 +20,8 @@ Drop into any web app directory, run `.\auto-zap.ps1`, and get a complete vulner
 - [Reports](#reports)
 - [Monorepo Support](#monorepo-support)
 - [Parallel Scans](#parallel-scans)
+- [Linux / macOS](#linux--macos)
+- [GitHub Actions](#github-actions)
 - [Prerequisites](#prerequisites)
 - [Troubleshooting](#troubleshooting)
 
@@ -623,6 +625,149 @@ cd C:\projects\app1
 cd C:\projects\app2
 .\auto-zap.ps1   # Automatically uses a different ZAP port
 ```
+
+---
+
+## Linux / macOS
+
+Auto-ZAP includes a native bash script (`auto-zap.sh`) for Linux and macOS. It uses Docker-based ZAP exclusively - no Java installation needed.
+
+### Quick Start (Linux)
+
+```bash
+# Make executable
+chmod +x auto-zap.sh
+
+# Auto-detect framework and scan
+./auto-zap.sh
+
+# Scan a specific URL
+./auto-zap.sh --url http://localhost:3000
+
+# Full scan with authentication
+./auto-zap.sh --full-scan --auth-token "eyJhbGciOiJIUzI1NiIs..."
+```
+
+### Requirements (Linux)
+
+- **Docker** (for ZAP and optional database containers)
+- **curl** and **jq** (pre-installed on most systems)
+
+### Platform Differences
+
+| Feature | Windows (`auto-zap.ps1`) | Linux (`auto-zap.sh`) |
+|---------|--------------------------|----------------------|
+| ZAP method | Local JAR or Docker | Docker only |
+| Java required | Yes (for local ZAP) | No |
+| Process management | `Win32_Process` | `pkill`, `kill` |
+| Port detection | `Get-NetTCPConnection` | `nc -z` |
+| Frameworks supported | 13 runtimes, 30+ frameworks | Same detection coverage |
+
+---
+
+## GitHub Actions
+
+Auto-ZAP works as a reusable GitHub Action for CI/CD security scanning.
+
+### Quick Start (CI)
+
+Add to your workflow:
+
+```yaml
+name: Security Scan
+on: [push, pull_request]
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bert-euraika/auto-zap@v1
+        with:
+          full-scan: false
+```
+
+### As a Reusable Action
+
+```yaml
+- name: Run security scan
+  id: scan
+  uses: bert-euraika/auto-zap@v1
+  with:
+    url: 'http://localhost:3000'          # Skip auto-detection
+    port: 3000                             # Override port
+    report-path: 'security-report.html'    # Custom report name
+    full-scan: true                        # Deep scan (slower)
+    skip-install: false                    # Skip npm/pip install
+    auth-token: ${{ secrets.AUTH_TOKEN }}   # Bearer token auth
+    working-directory: './apps/web'        # For monorepos
+
+- name: Check results
+  run: |
+    echo "High: ${{ steps.scan.outputs.high-count }}"
+    echo "Report: ${{ steps.scan.outputs.report-path }}"
+```
+
+### Action Inputs
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `url` | No | auto-detect | Target URL to scan |
+| `port` | No | auto-detect | Override app port |
+| `report-path` | No | `zap-report-<timestamp>.html` | Report path |
+| `full-scan` | No | `false` | Thorough scan mode |
+| `keep-docker` | No | `false` | Keep containers after scan |
+| `skip-install` | No | `false` | Skip dependency install |
+| `auth-user` | No | | Username for auth |
+| `auth-password` | No | | Password for auth |
+| `auth-token` | No | | Bearer token |
+| `auth-type` | No | auto | `form`, `json`, or `bearer` |
+| `working-directory` | No | `.` | Working directory |
+
+### Action Outputs
+
+| Output | Description |
+|--------|-------------|
+| `report-path` | Path to HTML report |
+| `json-path` | Path to JSON report |
+| `high-count` | Number of HIGH severity vulnerabilities |
+| `medium-count` | Number of MEDIUM severity vulnerabilities |
+| `low-count` | Number of LOW severity vulnerabilities |
+
+### Upload Reports as Artifacts
+
+```yaml
+- uses: bert-euraika/auto-zap@v1
+  id: scan
+
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: security-report
+    path: zap-report-*.html
+```
+
+### Scheduled Scans
+
+```yaml
+on:
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly Monday 2 AM
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bert-euraika/auto-zap@v1
+        with:
+          full-scan: true
+```
+
+### Platform Notes
+
+- **Linux runners** (`ubuntu-latest`): Uses Docker-based ZAP. Recommended for CI.
+- **Windows runners** (`windows-latest`): Uses local ZAP installation. Docker containers are NOT supported on Windows GitHub Actions runners.
 
 ---
 

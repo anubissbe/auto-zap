@@ -1,0 +1,107 @@
+name: OWASP ZAP Security Scan
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      target-url:
+        description: 'Target URL to scan (leave empty for auto-detection)'
+        required: false
+      full-scan:
+        description: 'Run full scan (slower but more thorough)'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly on Monday at 2 AM
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security-scan:
+    name: OWASP ZAP Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Conditional runtime setup based on project files
+      - name: Setup Node.js
+        if: hashFiles('**/package-lock.json', '**/yarn.lock', '**/pnpm-lock.yaml', '**/bun.lockb') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        if: hashFiles('**/requirements.txt', '**/pyproject.toml', '**/Pipfile') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup .NET
+        if: hashFiles('**/*.csproj', '**/*.sln') != ''
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Java
+        if: hashFiles('**/pom.xml', '**/build.gradle', '**/build.gradle.kts') != ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # Run the security scan
+      - name: Run Auto-ZAP security scan
+        id: zap-scan
+        uses: ./
+        with:
+          url: ${{ github.event.inputs.target-url || '' }}
+          full-scan: ${{ github.event.inputs.full-scan || 'false' }}
+        continue-on-error: true
+
+      # Upload reports as artifacts
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-security-report-html
+          path: zap-report-*.html
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-security-report-json
+          path: zap-report-*.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Job summary
+      - name: Security scan summary
+        if: always()
+        run: |
+          echo "### OWASP ZAP Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| HIGH | ${{ steps.zap-scan.outputs.high-count || '0' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| MEDIUM | ${{ steps.zap-scan.outputs.medium-count || '0' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| LOW | ${{ steps.zap-scan.outputs.low-count || '0' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Reports are available in the workflow artifacts." >> $GITHUB_STEP_SUMMARY
+
+      # Fail on high severity
+      - name: Fail if high severity vulnerabilities found
+        if: steps.zap-scan.outputs.high-count > 0
+        run: |
+          echo "::error::Found ${{ steps.zap-scan.outputs.high-count }} HIGH severity vulnerabilities"
+          exit 1
