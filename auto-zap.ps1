@@ -41,6 +41,12 @@
     Authentication type: "form", "json", or "bearer" (auto-detected if not provided)
 .PARAMETER UseDockerZap
     Force using Docker-based ZAP even if local install exists
+.PARAMETER ScanMode
+    Scan mode: "auto" (detect), "webapp", "api", "static". Auto detects project type.
+.PARAMETER DryRun
+    Show what the script would do without executing any actions.
+.PARAMETER VerboseLog
+    Log every decision point (fallback choices, detection results, etc.)
 .EXAMPLE
     .\auto-zap.ps1
     .\auto-zap.ps1 -Url http://localhost:8080
@@ -48,6 +54,9 @@
     .\auto-zap.ps1 -AuthToken "eyJhbGciOi..."
     .\auto-zap.ps1 -AuthUser admin -AuthPassword secret123
     .\auto-zap.ps1 -UseDockerZap
+    .\auto-zap.ps1 -ScanMode api
+    .\auto-zap.ps1 -DryRun
+    .\auto-zap.ps1 -ScanMode static -VerboseLog
 #>
 param(
     [string]$Url,
@@ -62,7 +71,11 @@ param(
     [string]$AuthToken,
     [ValidateSet("form", "json", "bearer", "")]
     [string]$AuthType,
-    [switch]$UseDockerZap
+    [switch]$UseDockerZap,
+    [ValidateSet("auto", "webapp", "api", "static", "")]
+    [string]$ScanMode = "auto",
+    [switch]$DryRun,
+    [switch]$VerboseLog
 )
 
 Set-StrictMode -Version Latest
@@ -82,7 +95,7 @@ if (-not $javaExe) {
     if ($javaInPath) { $javaExe = $javaInPath.Source }
 }
 
-# Search common install locations
+# Search common install locations (including scoop, chocolatey, SDKMAN, GraalVM)
 if (-not $javaExe) {
     $javaSearchPaths = @(
         "C:\Program Files\Eclipse Adoptium",
@@ -91,9 +104,23 @@ if (-not $javaExe) {
         "C:\Program Files\Zulu",
         "C:\Program Files\Eclipse Foundation",
         "C:\Program Files\BellSoft",
-        "C:\Program Files\Amazon Corretto"
+        "C:\Program Files\Amazon Corretto",
+        "C:\Program Files\GraalVM",
+        "$env:USERPROFILE\scoop\apps\openjdk*",
+        "$env:USERPROFILE\scoop\apps\temurin*",
+        "$env:USERPROFILE\scoop\apps\graalvm*",
+        "$env:USERPROFILE\scoop\apps\zulu*",
+        "$env:USERPROFILE\scoop\apps\corretto*",
+        "C:\ProgramData\chocolatey\lib\openjdk*",
+        "C:\ProgramData\chocolatey\lib\temurin*",
+        "C:\ProgramData\chocolatey\lib\graalvm*",
+        "C:\ProgramData\chocolatey\lib\zulu*",
+        "C:\ProgramData\chocolatey\lib\corretto*",
+        "$env:USERPROFILE\.sdkman\candidates\java",
+        "$env:USERPROFILE\.jabba\jdk"
     )
     foreach ($searchPath in $javaSearchPaths) {
+        if (-not (Test-Path $searchPath -ErrorAction SilentlyContinue)) { continue }
         $found = Get-ChildItem -Path $searchPath -Filter "java.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($found) {
             $javaExe = $found.FullName
@@ -118,7 +145,13 @@ $zapSearchDirs = @(
     "C:\Program Files (x86)\ZAP\Zed Attack Proxy",
     "C:\Program Files (x86)\OWASP\Zed Attack Proxy",
     "$env:LOCALAPPDATA\Programs\ZAP",
-    "$env:USERPROFILE\ZAP"
+    "$env:USERPROFILE\ZAP",
+    "$env:USERPROFILE\scoop\apps\zap\current",
+    "$env:USERPROFILE\scoop\apps\zaproxy\current",
+    "C:\ProgramData\chocolatey\lib\zap\tools",
+    "C:\ProgramData\chocolatey\lib\owasp-zap\tools",
+    "$env:LOCALAPPDATA\ZAP",
+    "$env:APPDATA\ZAP"
 )
 foreach ($searchDir in $zapSearchDirs) {
     if (Test-Path $searchDir) {
@@ -175,6 +208,13 @@ $script:ComposeServicesStartedByUs = $false
 $script:ComposeConfigFile = $null
 $script:ComposeConfigServices = @()
 $script:Manifest = $null
+$script:ProjectType = "unknown"          # webapp, api-only, library, cli, worker, unknown
+$script:EffectiveScanMode = $ScanMode    # Resolved scan mode after auto-detection
+$script:ScanStartTime = Get-Date
+$script:FallbacksTriggered = @()
+$script:DockerAvailable = $null          # Cached Docker availability check
+$script:StaticAnalysisResults = @()
+$script:DbStartedLocally = $false
 
 # Default report name with timestamp
 if (-not $ReportPath) {
@@ -183,7 +223,7 @@ if (-not $ReportPath) {
 }
 
 # --- Load .auto-zap.json config ---
-function Import-AutoZapConfig {
+function Load-AutoZapConfig {
     $configPath = Join-Path $script:OriginalDir ".auto-zap.json"
     if (-not (Test-Path $configPath)) {
         $script:Config = $null
@@ -201,7 +241,7 @@ function Import-AutoZapConfig {
 }
 
 # --- Start background services from config ---
-function Start-BackgroundService {
+function Start-BackgroundServices {
     if (-not $script:Config -or -not $script:Config.services) { return }
 
     Write-Step "STEP 4c: Starting background services..."
@@ -244,7 +284,7 @@ function Start-BackgroundService {
 }
 
 # --- Start Docker Compose services from config ---
-function Start-ComposeService {
+function Start-ComposeServices {
     if (-not $script:Config -or -not $script:Config.compose) { return $false }
 
     $compose = $script:Config.compose
@@ -274,10 +314,14 @@ function Start-ComposeService {
         return $false
     }
 
-    if (-not (Test-DockerRunning)) {
-        Write-Err "Docker Compose failed to start services: $($services -join ', ')"
-        Write-Err "    Fix: Run 'docker compose -f $composeFilePath up -d $($services -join ' ')' manually to see the error."
-        Write-Err "         Check the `"compose`" section in .auto-zap.json."
+    if (-not (Test-Command "docker")) {
+        Write-Warn "Docker not available. Skipping Docker Compose services."
+        Write-VerboseLog "Docker CLI not found - cannot start compose services."
+        return $false
+    }
+    if (-not (Ensure-DockerRunning)) {
+        Write-Warn "Docker Compose cannot start - Docker daemon not running."
+        Write-Warn "    Fix: Start Docker Desktop or run 'docker compose -f $composeFilePath up -d $($services -join ' ')' manually."
         return $false
     }
 
@@ -308,6 +352,171 @@ function Write-Ok($msg)      { Write-Host "[+] $msg" -ForegroundColor Green }
 function Write-Warn($msg)    { Write-Host "[!] $msg" -ForegroundColor Yellow }
 function Write-Err($msg)     { Write-Host "[-] $msg" -ForegroundColor Red }
 function Write-Detail($msg)  { Write-Host "    $msg" -ForegroundColor DarkGray }
+function Write-VerboseLog($msg) { if ($VerboseLog) { Write-Host "[V] $msg" -ForegroundColor DarkCyan } }
+function Write-DryRun($msg)  { if ($DryRun) { Write-Host "[DRY-RUN] $msg" -ForegroundColor Magenta } }
+
+function Test-DockerAvailable {
+    if ($null -ne $script:DockerAvailable) { return $script:DockerAvailable }
+    if (-not (Test-Command "docker")) {
+        $script:DockerAvailable = $false
+        Write-VerboseLog "Docker CLI not found in PATH."
+        return $false
+    }
+    $dockerInfo = docker info 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-VerboseLog "Docker CLI found but daemon not running."
+        $script:DockerAvailable = $false
+        return $false
+    }
+    $script:DockerAvailable = $true
+    return $true
+}
+
+function Invoke-WithRetry {
+    param(
+        [scriptblock]$ScriptBlock,
+        [int]$MaxRetries = 3,
+        [int]$DelaySeconds = 5,
+        [string]$Label = "operation"
+    )
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            return (& $ScriptBlock)
+        } catch {
+            if ($attempt -lt $MaxRetries) {
+                Write-VerboseLog "Retry $attempt/$MaxRetries for $Label after error: $($_.Exception.Message)"
+                Start-Sleep -Seconds $DelaySeconds
+            } else {
+                throw
+            }
+        }
+    }
+}
+
+function Test-IsWSL {
+    # Detect if running inside WSL or a container
+    if ($env:WSL_DISTRO_NAME) { return $true }
+    if ($env:CONTAINER -or $env:container) { return $true }
+    if (Test-Path "/.dockerenv") { return $true }
+    return $false
+}
+
+function Get-LocalhostAddress {
+    # In WSL/containers, localhost may need to be host.docker.internal or the host IP
+    if (Test-IsWSL) {
+        Write-VerboseLog "Running in WSL/container - adjusting localhost references."
+        return "host.docker.internal"
+    }
+    return "localhost"
+}
+
+function Test-WindowsService([string]$ServiceName) {
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") { return $true }
+    return $false
+}
+
+function Install-ZapAutomatic {
+    Write-Step "Attempting to install OWASP ZAP automatically..."
+
+    # Strategy 1: winget
+    if (Test-Command "winget") {
+        Write-VerboseLog "Trying winget install ZAP.ZAP..."
+        Write-Step "Installing ZAP via winget..."
+        $result = & winget install ZAP.ZAP --accept-source-agreements --accept-package-agreements 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $script:FallbacksTriggered += "ZAP installed via winget"
+            # Re-scan for ZAP
+            foreach ($searchDir in $zapSearchDirs) {
+                if (Test-Path $searchDir) {
+                    $jar = Get-ChildItem -Path $searchDir -Filter "zap-*.jar" -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($jar) {
+                        $script:ZapPath = $searchDir
+                        Write-Ok "ZAP installed via winget at $searchDir"
+                        return $true
+                    }
+                }
+            }
+            # Also check new default install locations
+            foreach ($root in @("C:\Program Files", "C:\Program Files (x86)")) {
+                if (-not (Test-Path $root)) { continue }
+                $zapDir = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "ZAP|Zed Attack" } | Select-Object -First 1
+                if ($zapDir) {
+                    $jar = Get-ChildItem -Path $zapDir.FullName -Filter "zap-*.jar" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($jar) {
+                        $script:ZapPath = $jar.DirectoryName
+                        Write-Ok "ZAP installed via winget at $($jar.DirectoryName)"
+                        return $true
+                    }
+                }
+            }
+        }
+        Write-VerboseLog "winget install did not succeed or ZAP not found after install."
+    }
+
+    # Strategy 2: scoop
+    if (Test-Command "scoop") {
+        Write-VerboseLog "Trying scoop install zaproxy..."
+        Write-Step "Installing ZAP via scoop..."
+        $result = & scoop install zaproxy 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $scoopZapPath = "$env:USERPROFILE\scoop\apps\zaproxy\current"
+            if (Test-Path $scoopZapPath) {
+                $jar = Get-ChildItem -Path $scoopZapPath -Filter "zap-*.jar" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($jar) {
+                    $script:ZapPath = $jar.DirectoryName
+                    $script:FallbacksTriggered += "ZAP installed via scoop"
+                    Write-Ok "ZAP installed via scoop."
+                    return $true
+                }
+            }
+        }
+        Write-VerboseLog "scoop install did not succeed."
+    }
+
+    # Strategy 3: Download standalone ZAP JAR from GitHub releases (requires Java)
+    if ($javaExe) {
+        Write-Step "Downloading ZAP standalone JAR from GitHub..."
+        $zapDownloadDir = Join-Path $env:TEMP "zap-standalone"
+        if (-not (Test-Path $zapDownloadDir)) { New-Item -ItemType Directory -Path $zapDownloadDir -Force | Out-Null }
+
+        try {
+            # Get latest release info from GitHub API
+            $releaseInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/zaproxy/zaproxy/releases/latest" -TimeoutSec 30 -ErrorAction Stop
+            $zapJarAsset = $releaseInfo.assets | Where-Object { $_.name -match "ZAP_.*\.jar$" -or $_.name -match "zap-.*\.jar$" } | Select-Object -First 1
+            if (-not $zapJarAsset) {
+                # Fall back to the core jar download URL pattern
+                $version = $releaseInfo.tag_name -replace '^v', ''
+                $jarUrl = "https://github.com/zaproxy/zaproxy/releases/download/$($releaseInfo.tag_name)/ZAP_${version}_Core.jar"
+                Write-VerboseLog "No JAR asset found; trying constructed URL: $jarUrl"
+            } else {
+                $jarUrl = $zapJarAsset.browser_download_url
+            }
+
+            $localJar = Join-Path $zapDownloadDir "zap-standalone.jar"
+            Write-Detail "Downloading from: $jarUrl"
+            Invoke-WebRequest -Uri $jarUrl -OutFile $localJar -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
+
+            if (Test-Path $localJar) {
+                $script:ZapPath = $zapDownloadDir
+                $script:FallbacksTriggered += "ZAP downloaded as standalone JAR"
+                Write-Ok "ZAP standalone JAR downloaded to $zapDownloadDir"
+                return $true
+            }
+        } catch {
+            Write-VerboseLog "Failed to download ZAP JAR: $($_.Exception.Message)"
+        }
+    } else {
+        Write-VerboseLog "Cannot download standalone JAR: Java not found."
+    }
+
+    Write-Err "Could not install ZAP automatically."
+    Write-Err "    Fix: Install manually with: winget install ZAP.ZAP"
+    Write-Err "         Or download from: https://www.zaproxy.org/download/"
+    Write-Err "         Or install Java and rerun (will download standalone JAR)."
+    return $false
+}
 
 function Stop-ProcessTree([int]$ParentPid) {
     try {
@@ -316,7 +525,7 @@ function Stop-ProcessTree([int]$ParentPid) {
         foreach ($child in $children) {
             Stop-ProcessTree $child.ProcessId
         }
-    } catch { $null = $_ }
+    } catch {}
     Stop-Process -Id $ParentPid -Force -ErrorAction SilentlyContinue
 }
 
@@ -339,12 +548,12 @@ function Cleanup {
     }
 
     # Stop ZAP
-    if ($script:UsingDockerZap) {
+    if ($script:UsingDockerZap -and (Test-Command "docker")) {
         Write-Detail "Stopping ZAP Docker container..."
         try {
             Invoke-RestMethod "http://localhost:$ZapApiPort/JSON/core/action/shutdown/?apikey=$ZapApiKey" -TimeoutSec 5 -ErrorAction SilentlyContinue | Out-Null
             Start-Sleep -Seconds 3
-        } catch { $null = $_ }
+        } catch {}
         docker stop $script:ZapDockerContainer 2>$null | Out-Null
         docker rm $script:ZapDockerContainer 2>$null | Out-Null
     } elseif ($script:ZapProcess -and !$script:ZapProcess.HasExited) {
@@ -352,14 +561,14 @@ function Cleanup {
         try {
             Invoke-RestMethod "http://localhost:$ZapApiPort/JSON/core/action/shutdown/?apikey=$ZapApiKey" -TimeoutSec 5 -ErrorAction SilentlyContinue | Out-Null
             Start-Sleep -Seconds 3
-        } catch { $null = $_ }
+        } catch {}
         if (!$script:ZapProcess.HasExited) {
             Stop-ProcessTree $script:ZapProcess.Id
         }
     }
 
-    # Stop Docker containers we started (unless -KeepDocker)
-    if ($script:DbContainerStartedByUs -and -not $KeepDocker -and $script:DbContainerName) {
+    # Stop Docker containers we started (unless -KeepDocker) - only if Docker is available
+    if ((Test-Command "docker") -and $script:DbContainerStartedByUs -and -not $KeepDocker -and $script:DbContainerName) {
         Write-Detail "Stopping database container..."
         if ($script:DbStartedViaCompose -and $script:ComposeFile) {
             docker compose -f $script:ComposeFile stop $script:DbContainerName 2>$null | Out-Null
@@ -368,15 +577,21 @@ function Cleanup {
         }
     }
 
+    # Stop locally-started database services (non-Docker)
+    if ($script:DbStartedLocally -and $script:DetectedDbType) {
+        Write-Detail "Note: locally-installed $($script:DetectedDbType) service was started by this script."
+        Write-Detail "It will continue running as a Windows service."
+    }
+
     # Stop Docker Compose services if we started them
-    if ($script:ComposeServicesStartedByUs -and -not $KeepDocker -and $script:ComposeConfigFile) {
+    if ((Test-Command "docker") -and $script:ComposeServicesStartedByUs -and -not $KeepDocker -and $script:ComposeConfigFile) {
         Write-Detail "Stopping Docker Compose services..."
         $svcArgs = $script:ComposeConfigServices -join " "
         docker compose -f $script:ComposeConfigFile stop $svcArgs 2>$null | Out-Null
     }
 
     # Stop Redis container if we started it
-    if ($script:RedisContainerStartedByUs -and -not $KeepDocker) {
+    if ((Test-Command "docker") -and $script:RedisContainerStartedByUs -and -not $KeepDocker) {
         Write-Detail "Stopping Redis container..."
         docker stop $script:RedisContainerName 2>$null | Out-Null
     }
@@ -398,7 +613,7 @@ function Get-FreePort {
         $listener.Start()
         $listener.Stop()
         return $PreferredPort
-    } catch { $null = $_ }
+    } catch {}
     # Preferred port occupied - let OS assign a free one
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -460,7 +675,7 @@ function Invoke-ZapApi([string]$Endpoint) {
 }
 
 # --- Load .env files into process environment ---
-function Import-EnvFile {
+function Import-EnvFiles {
     # Most specific first - "don't override" semantics means first writer wins
     $envFiles = @(".env.development.local", ".env.local", ".env.development", ".env")
     # Monorepo root first so app-dir values override root values
@@ -545,7 +760,7 @@ function Build-ScanManifest {
 
 function Sync-Manifest {
     if (-not $script:Manifest) { return }
-    # Re-sync fields that may have been updated by later steps (Initialize-Database, Initialize-RedisCache, etc.)
+    # Re-sync fields that may have been updated by later steps (Ensure-Database, Ensure-Redis, etc.)
     if ($script:ComposeFile -and -not $script:Manifest.ComposeFile) {
         $script:Manifest.ComposeFile = $script:ComposeFile
     }
@@ -685,11 +900,11 @@ function Find-DockerDesktop {
 }
 
 # --- Ensure Docker daemon is running ---
-function Test-DockerRunning {
+function Ensure-DockerRunning {
     if (-not (Test-Command "docker")) {
         return $false
     }
-    $null = docker info 2>&1
+    $dockerInfo = docker info 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Step "Docker daemon is not running. Starting Docker Desktop..."
         $dockerDesktopPath = Find-DockerDesktop
@@ -718,7 +933,7 @@ function Test-DockerRunning {
 }
 
 # --- Detect and ensure Docker + database ---
-function Initialize-Database {
+function Ensure-Database {
     $dbConfig = Get-DatabaseConfig
     if (-not $dbConfig) {
         Write-Warn "No DATABASE_URL found in .env files. Skipping database setup."
@@ -727,9 +942,31 @@ function Initialize-Database {
 
     $script:DetectedDbType = $dbConfig.Type
 
-    # SQLite needs no server
+    # SQLite needs no server - just ensure path exists for cross-platform
     if ($dbConfig.Type -eq "SQLite") {
         Write-Ok "SQLite database detected. No server needed."
+        # Ensure the SQLite directory exists (cross-platform path handling)
+        $envFiles = @(".env.local", ".env", ".env.development", ".env.development.local")
+        foreach ($f in $envFiles) {
+            $envPath = Join-Path $script:OriginalDir $f
+            if (Test-Path $envPath) {
+                $content = Get-Content $envPath -Raw
+                if ($content -match 'DATABASE_URL\s*=\s*"?(?:file:|sqlite:)(?://)?(.+?)(?:\?|"|$)') {
+                    $sqlitePath = $Matches[1].Trim()
+                    # Normalize path separators
+                    $sqlitePath = $sqlitePath -replace '/', '\'
+                    if (-not [System.IO.Path]::IsPathRooted($sqlitePath)) {
+                        $sqlitePath = Join-Path $script:OriginalDir $sqlitePath
+                    }
+                    $sqliteDir = Split-Path $sqlitePath -Parent
+                    if ($sqliteDir -and -not (Test-Path $sqliteDir)) {
+                        Write-VerboseLog "Creating SQLite directory: $sqliteDir"
+                        New-Item -ItemType Directory -Path $sqliteDir -Force -ErrorAction SilentlyContinue | Out-Null
+                    }
+                    break
+                }
+            }
+        }
         return $true
     }
 
@@ -743,15 +980,175 @@ function Initialize-Database {
         Write-Ok "Database is already running on port $($dbConfig.Port)."
         return $true
     } catch {
-        Write-Detail "Database not reachable. Will attempt to start via Docker..."
+        Write-VerboseLog "Database not reachable on $($dbConfig.Host):$($dbConfig.Port)."
     }
 
-    # Need Docker
-    if (-not (Test-DockerRunning)) {
-        Write-Err "Database ($($dbConfig.Type)) required but not reachable on port $($dbConfig.Port), and Docker is not available."
-        Write-Err "    Fix: Start the database manually, or install Docker: winget install Docker.DockerDesktop"
-        Write-Err "         Or update DATABASE_URL in .env to point to a running database."
-        return $false
+    # --- Strategy 0: Check for locally installed database as Windows service ---
+    Write-VerboseLog "Checking for locally installed $($dbConfig.Type) services..."
+    $localServiceStarted = $false
+
+    if ($dbConfig.Type -eq "PostgreSQL") {
+        $pgServices = @("postgresql*", "pgsql*")
+        foreach ($svcPattern in $pgServices) {
+            $svc = Get-Service -Name $svcPattern -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($svc) {
+                if ($svc.Status -ne "Running") {
+                    Write-Step "Found local PostgreSQL service ($($svc.Name)). Starting..."
+                    try {
+                        Start-Service -Name $svc.Name -ErrorAction Stop
+                        $script:DbStartedLocally = $true
+                        $localServiceStarted = $true
+                        $script:FallbacksTriggered += "PostgreSQL started as local Windows service"
+                    } catch {
+                        Write-VerboseLog "Cannot start service $($svc.Name): $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-VerboseLog "PostgreSQL service already running: $($svc.Name)"
+                    $localServiceStarted = $true
+                }
+                break
+            }
+        }
+        # Also check for pg_isready if available
+        if (-not $localServiceStarted -and (Test-Command "pg_isready")) {
+            Write-VerboseLog "pg_isready found, PostgreSQL may be installed locally."
+        }
+    } elseif ($dbConfig.Type -eq "MySQL") {
+        $mysqlServices = @("mysql*", "mariadb*")
+        foreach ($svcPattern in $mysqlServices) {
+            $svc = Get-Service -Name $svcPattern -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($svc) {
+                if ($svc.Status -ne "Running") {
+                    Write-Step "Found local MySQL service ($($svc.Name)). Starting..."
+                    try {
+                        Start-Service -Name $svc.Name -ErrorAction Stop
+                        $script:DbStartedLocally = $true
+                        $localServiceStarted = $true
+                        $script:FallbacksTriggered += "MySQL started as local Windows service"
+                    } catch {
+                        Write-VerboseLog "Cannot start service $($svc.Name): $($_.Exception.Message)"
+                    }
+                } else {
+                    $localServiceStarted = $true
+                }
+                break
+            }
+        }
+    } elseif ($dbConfig.Type -eq "MongoDB") {
+        $svc = Get-Service -Name "MongoDB*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($svc) {
+            if ($svc.Status -ne "Running") {
+                Write-Step "Found local MongoDB service ($($svc.Name)). Starting..."
+                try {
+                    Start-Service -Name $svc.Name -ErrorAction Stop
+                    $script:DbStartedLocally = $true
+                    $localServiceStarted = $true
+                    $script:FallbacksTriggered += "MongoDB started as local Windows service"
+                } catch {
+                    Write-VerboseLog "Cannot start service $($svc.Name): $($_.Exception.Message)"
+                }
+            } else {
+                $localServiceStarted = $true
+            }
+        }
+    } elseif ($dbConfig.Type -eq "MSSQL") {
+        $mssqlServices = @("MSSQLSERVER", "MSSQL`$*", "SQLEXPRESS*")
+        foreach ($svcPattern in $mssqlServices) {
+            $svc = Get-Service -Name $svcPattern -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($svc) {
+                if ($svc.Status -ne "Running") {
+                    Write-Step "Found local MSSQL service ($($svc.Name)). Starting..."
+                    try {
+                        Start-Service -Name $svc.Name -ErrorAction Stop
+                        $script:DbStartedLocally = $true
+                        $localServiceStarted = $true
+                        $script:FallbacksTriggered += "MSSQL started as local Windows service"
+                    } catch {
+                        Write-VerboseLog "Cannot start service $($svc.Name): $($_.Exception.Message)"
+                    }
+                } else {
+                    $localServiceStarted = $true
+                }
+                break
+            }
+        }
+    }
+
+    if ($localServiceStarted) {
+        if (Wait-ForTcp $dbConfig.Host $dbConfig.Port -TimeoutSec 30 -Label "$($dbConfig.Type) (local service)") {
+            Write-Ok "Local $($dbConfig.Type) service is ready."
+            return $true
+        }
+        Write-VerboseLog "Local service found but not accepting connections on port $($dbConfig.Port)."
+    }
+
+    # --- Strategy 0b: Try to install database via package managers ---
+    if (-not $localServiceStarted) {
+        Write-VerboseLog "No local $($dbConfig.Type) service found. Trying package manager install..."
+        $pkgInstalled = $false
+
+        $pkgMgrCommands = @{
+            "PostgreSQL" = @{
+                winget = "winget install PostgreSQL.PostgreSQL --accept-source-agreements --accept-package-agreements"
+                scoop  = "scoop install postgresql"
+                choco  = "choco install postgresql -y"
+            }
+            "MySQL" = @{
+                winget = "winget install Oracle.MySQL --accept-source-agreements --accept-package-agreements"
+                scoop  = "scoop install mysql"
+                choco  = "choco install mysql -y"
+            }
+            "MongoDB" = @{
+                winget = "winget install MongoDB.Server --accept-source-agreements --accept-package-agreements"
+                choco  = "choco install mongodb -y"
+            }
+            "MSSQL" = @{
+                winget = "winget install Microsoft.SQLServer.2022.Express --accept-source-agreements --accept-package-agreements"
+                choco  = "choco install sql-server-express -y"
+            }
+        }
+
+        $dbPkgs = $pkgMgrCommands[$dbConfig.Type]
+        if ($dbPkgs) {
+            foreach ($pmName in @("winget", "scoop", "choco")) {
+                if (-not $dbPkgs[$pmName]) { continue }
+                if (-not (Test-Command $pmName)) { continue }
+
+                Write-Step "Attempting to install $($dbConfig.Type) via $pmName..."
+                Write-VerboseLog "Running: $($dbPkgs[$pmName])"
+                try {
+                    $installResult = & cmd.exe /c "$($dbPkgs[$pmName]) 2>&1"
+                    if ($LASTEXITCODE -eq 0) {
+                        $script:FallbacksTriggered += "$($dbConfig.Type) installed via $pmName"
+                        Write-Ok "$($dbConfig.Type) installed via $pmName."
+                        $pkgInstalled = $true
+                        # Wait for the service to come up
+                        Start-Sleep -Seconds 10
+                        if (Wait-ForTcp $dbConfig.Host $dbConfig.Port -TimeoutSec 60 -Label "$($dbConfig.Type) (newly installed)") {
+                            return $true
+                        }
+                    }
+                } catch {
+                    Write-VerboseLog "$pmName install failed: $($_.Exception.Message)"
+                }
+                if ($pkgInstalled) { break }
+            }
+        }
+    }
+
+    # --- Strategy 1+: Docker-based fallbacks (only if Docker is available) ---
+    Write-VerboseLog "Checking Docker availability for database fallback..."
+    if (-not (Ensure-DockerRunning)) {
+        Write-Warn "Database ($($dbConfig.Type)) not reachable on port $($dbConfig.Port) and Docker is not available."
+        Write-Warn "Manual setup required:"
+        Write-Warn "    1. Install $($dbConfig.Type) via: winget install / scoop install / choco install"
+        Write-Warn "    2. Start the service and ensure it listens on port $($dbConfig.Port)"
+        Write-Warn "    3. Or update DATABASE_URL in .env to point to a running database"
+        Write-Warn "    4. Or install Docker: winget install Docker.DockerDesktop"
+        Write-Warn ""
+        Write-Warn "Continuing anyway - the app may have an embedded DB or work without one for scanning."
+        $script:FallbacksTriggered += "Database unavailable - continuing without"
+        return $true
     }
 
     # Strategy 1: Check for an existing stopped container for this database
@@ -795,7 +1192,7 @@ function Initialize-Database {
         Write-Step "Starting database via docker compose ($composeFile)..."
         $dbServiceStarted = $false
         foreach ($svcName in @("db", "database", "postgres", "postgresql", "mysql", "mariadb", "mongo", "mongodb", "mssql", "sqlserver")) {
-            $null = docker compose -f (Join-Path $composeDir $composeFile) up -d $svcName 2>&1
+            $result = docker compose -f (Join-Path $composeDir $composeFile) up -d $svcName 2>&1
             if ($LASTEXITCODE -eq 0) {
                 $script:DbContainerName = $svcName
                 $script:DbContainerStartedByUs = $true
@@ -872,7 +1269,7 @@ function Initialize-Database {
 }
 
 # --- Ensure Redis if needed ---
-function Initialize-RedisCache {
+function Ensure-Redis {
     $redisConfig = Get-RedisConfig
     if (-not $redisConfig) { return }
 
@@ -886,11 +1283,35 @@ function Initialize-RedisCache {
         Write-Ok "Redis is already running on port $($redisConfig.Port)."
         return
     } catch {
-        Write-Detail "Redis not reachable. Will attempt to start via Docker..."
+        Write-VerboseLog "Redis not reachable on $($redisConfig.Host):$($redisConfig.Port)."
     }
 
-    if (-not (Test-DockerRunning)) {
+    # Check for local Redis Windows service
+    $redisSvc = Get-Service -Name "Redis*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($redisSvc) {
+        if ($redisSvc.Status -ne "Running") {
+            Write-Step "Found local Redis service. Starting..."
+            try { Start-Service -Name $redisSvc.Name -ErrorAction Stop } catch {}
+        }
+        if (Wait-ForTcp $redisConfig.Host $redisConfig.Port -TimeoutSec 15 -Label "Redis (local)") {
+            $script:FallbacksTriggered += "Redis started as local Windows service"
+            return
+        }
+    }
+
+    # Check for redis-server in PATH
+    if (Test-Command "redis-server") {
+        Write-Step "Starting redis-server from PATH..."
+        Start-Process -FilePath "redis-server" -ArgumentList "--port $($redisConfig.Port) --daemonize yes" -NoNewWindow -ErrorAction SilentlyContinue
+        if (Wait-ForTcp $redisConfig.Host $redisConfig.Port -TimeoutSec 15 -Label "Redis (local binary)") {
+            $script:FallbacksTriggered += "Redis started from PATH"
+            return
+        }
+    }
+
+    if (-not (Ensure-DockerRunning)) {
         Write-Warn "Docker not available. Cannot start Redis. Continuing without it."
+        $script:FallbacksTriggered += "Redis unavailable - continuing without"
         return
     }
 
@@ -939,7 +1360,7 @@ function Get-NodePackageManager {
 }
 
 # --- Ensure package manager is installed ---
-function Test-PackageManager([string]$Name) {
+function Ensure-PackageManager([string]$Name) {
     if ($Name -eq "npm") { return $true }
 
     # Check if already available
@@ -990,7 +1411,7 @@ function Test-PackageManager([string]$Name) {
 }
 
 # --- Detect web app framework ---
-function Get-AppFramework {
+function Detect-AppFramework {
     $dir = $script:OriginalDir
 
     # --- Monorepo detection ---
@@ -1003,7 +1424,7 @@ function Get-AppFramework {
         try {
             $rootPkg = Get-Content (Join-Path $dir "package.json") -Raw | ConvertFrom-Json
             if ($rootPkg.workspaces) { $isMonorepo = $true; $monorepoType = "npm/yarn workspace" }
-        } catch { $null = $_ }
+        } catch {}
     }
 
     if ($isMonorepo) {
@@ -1087,7 +1508,7 @@ function Get-AppFramework {
                         $relPath = $pkgFile.DirectoryName.Substring($dir.Length).TrimStart('\', '/')
                         $matchedApps += @{ Path = $pkgFile.DirectoryName; RelPath = $relPath }
                     }
-                } catch { $null = $_ }
+                } catch {}
             }
 
             if ($matchedApps.Count -gt 0) {
@@ -1590,7 +2011,7 @@ function Get-AppFramework {
         foreach ($name in @("deno.json", "deno.jsonc")) {
             $dpath = Join-Path $dir $name
             if (Test-Path $dpath) {
-                try { $denoConfig = Get-Content $dpath -Raw | ConvertFrom-Json } catch { $null = $_ }
+                try { $denoConfig = Get-Content $dpath -Raw | ConvertFrom-Json } catch {}
                 break
             }
         }
@@ -1675,7 +2096,481 @@ function Get-AppFramework {
     return $null
 }
 
-function Invoke-ProjectCommand([string]$Label, [string]$Command, [string]$WorkDir) {
+# =============================================================
+# PROJECT TYPE CLASSIFICATION
+# =============================================================
+function Get-ProjectType {
+    param(
+        [hashtable]$Framework,
+        [string]$ProjectDir
+    )
+
+    # If ScanMode is explicitly set (not auto), use it directly
+    if ($ScanMode -and $ScanMode -ne "auto") {
+        $mapping = @{ "webapp" = "webapp"; "api" = "api-only"; "static" = "library" }
+        $result = $mapping[$ScanMode]
+        if ($result) {
+            Write-VerboseLog "Project type forced by -ScanMode: $result"
+            return $result
+        }
+    }
+
+    if (-not $Framework) { return "unknown" }
+
+    $dir = $ProjectDir
+    $subFramework = $Framework.SubFramework
+    $runtime = $Framework.Runtime
+
+    # Known webapp frameworks (serve HTML)
+    $webappFrameworks = @("Next.js", "Nuxt", "Remix", "SvelteKit", "Angular", "Gatsby", "Astro", "Vite", "WordPress", "Laravel", "Symfony", "Phoenix", "Rails")
+    if ($subFramework -and $webappFrameworks -contains $subFramework) {
+        Write-VerboseLog "Project type: webapp (framework: $subFramework)"
+        return "webapp"
+    }
+
+    # Static sites
+    if ($runtime -eq "Static") {
+        Write-VerboseLog "Project type: webapp (static site)"
+        return "webapp"
+    }
+    if ($runtime -eq "Docker") {
+        Write-VerboseLog "Project type: webapp (Docker-based, assuming webapp)"
+        return "webapp"
+    }
+
+    # Check for library indicators
+    if (Test-Path (Join-Path $dir "package.json")) {
+        $pkg = Get-Content (Join-Path $dir "package.json") -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($pkg) {
+            # Library: has "main"/"exports" but no "scripts.start"/"scripts.dev" or it's purely a publish target
+            $hasMain = ($null -ne $pkg.main -or $null -ne $pkg.exports -or $null -ne $pkg.types)
+            $hasStart = ($pkg.scripts -and ($pkg.scripts.start -or $pkg.scripts.dev))
+            $hasBin = ($null -ne $pkg.bin)
+
+            if ($hasBin -and -not $hasStart) {
+                Write-VerboseLog "Project type: cli (has bin entry, no start script)"
+                return "cli"
+            }
+            if ($hasMain -and -not $hasStart) {
+                Write-VerboseLog "Project type: library (has main/exports, no start script)"
+                return "library"
+            }
+        }
+    }
+
+    # Check for CLI indicators in Python
+    if ($runtime -eq "Python" -and (Test-Path (Join-Path $dir "pyproject.toml"))) {
+        $pyproject = Get-Content (Join-Path $dir "pyproject.toml") -Raw -ErrorAction SilentlyContinue
+        if ($pyproject -match '\[project\.scripts\]' -or $pyproject -match '\[tool\.poetry\.scripts\]' -or $pyproject -match 'console_scripts') {
+            if (-not ($pyproject -match 'uvicorn|fastapi|flask|django|gunicorn')) {
+                Write-VerboseLog "Project type: cli (Python with console_scripts, no web framework)"
+                return "cli"
+            }
+        }
+    }
+
+    # Check for worker patterns
+    $workerIndicators = @("worker.js", "worker.ts", "consumer.js", "consumer.ts", "processor.js", "processor.ts", "celery.py", "tasks.py")
+    $hasWorkerFiles = $false
+    foreach ($wf in $workerIndicators) {
+        if (Test-Path (Join-Path $dir $wf)) { $hasWorkerFiles = $true; break }
+    }
+    if (Test-Path (Join-Path $dir "package.json")) {
+        $pkgText = Get-Content (Join-Path $dir "package.json") -Raw -ErrorAction SilentlyContinue
+        if ($pkgText -match '"bullmq"|"bull"|"amqplib"|"kafkajs"|"@nestjs/microservices"' -and $hasWorkerFiles) {
+            Write-VerboseLog "Project type: worker (message queue dependencies + worker files)"
+            return "worker"
+        }
+    }
+
+    # Known API-only frameworks (no HTML pages)
+    $apiOnlyFrameworks = @("Express", "Fastify", "Hono", "NestJS", "AdonisJS")
+    if ($subFramework -and $apiOnlyFrameworks -contains $subFramework) {
+        # These COULD serve HTML, so check for views/templates/public dirs
+        $hasViews = (Test-Path (Join-Path $dir "views")) -or (Test-Path (Join-Path $dir "templates")) -or (Test-Path (Join-Path $dir "public\index.html")) -or (Test-Path (Join-Path $dir "src\views"))
+        if (-not $hasViews) {
+            Write-VerboseLog "Project type: api-only (framework: $subFramework, no views/templates)"
+            return "api-only"
+        }
+        Write-VerboseLog "Project type: webapp (framework: $subFramework, has views/templates)"
+        return "webapp"
+    }
+    if ($subFramework -eq "FastAPI" -or $subFramework -eq "Flask") {
+        $hasTemplates = (Test-Path (Join-Path $dir "templates")) -or (Test-Path (Join-Path $dir "static\index.html"))
+        if (-not $hasTemplates) {
+            Write-VerboseLog "Project type: api-only (framework: $subFramework, no templates)"
+            return "api-only"
+        }
+        return "webapp"
+    }
+    if ($subFramework -eq "Django") {
+        return "webapp"
+    }
+
+    # Go/Rust without clear web indication
+    if ($runtime -eq "Go" -or $runtime -eq "Rust") {
+        # Check for HTML templates
+        $hasTemplates = (Get-ChildItem -Path $dir -Filter "*.html" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (-not $hasTemplates) {
+            Write-VerboseLog "Project type: api-only ($runtime without HTML templates)"
+            return "api-only"
+        }
+        return "webapp"
+    }
+
+    # .NET - check for MVC views vs API-only
+    if ($runtime -eq ".NET") {
+        $hasViews = (Test-Path (Join-Path $dir "Views")) -or (Test-Path (Join-Path $dir "Pages"))
+        if (-not $hasViews) {
+            Write-VerboseLog "Project type: api-only (.NET without Views/Pages)"
+            return "api-only"
+        }
+        return "webapp"
+    }
+
+    # Java Spring Boot - check for templates
+    if ($runtime -eq "Java") {
+        $hasThymeleaf = (Test-Path (Join-Path $dir "src\main\resources\templates"))
+        if (-not $hasThymeleaf) {
+            Write-VerboseLog "Project type: api-only (Java without templates)"
+            return "api-only"
+        }
+        return "webapp"
+    }
+
+    Write-VerboseLog "Project type: webapp (default)"
+    return "webapp"
+}
+
+# =============================================================
+# STATIC ANALYSIS (for library/cli/worker projects)
+# =============================================================
+function Run-StaticAnalysis {
+    param(
+        [hashtable]$Framework,
+        [string]$ProjectDir
+    )
+
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Yellow
+    Write-Host "     STATIC ANALYSIS MODE (no live scan needed)" -ForegroundColor Yellow
+    Write-Host "================================================================" -ForegroundColor Yellow
+    Write-Host ""
+
+    $results = @()
+    $dir = $ProjectDir
+    $runtime = if ($Framework) { $Framework.Runtime } else { "unknown" }
+
+    # --- npm audit ---
+    if (($runtime -eq "Node.js" -or (Test-Path (Join-Path $dir "package.json"))) -and (Test-Command "npm")) {
+        Write-Step "Running npm audit..."
+        try {
+            $npmAuditOutput = & cmd.exe /c "cd /d `"$dir`" && npm audit --json 2>nul"
+            if ($npmAuditOutput) {
+                $auditJson = $npmAuditOutput | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($auditJson -and $auditJson.vulnerabilities) {
+                    $vulnCount = 0
+                    $auditJson.vulnerabilities.PSObject.Properties | ForEach-Object {
+                        $v = $_.Value
+                        $results += @{
+                            Tool     = "npm audit"
+                            Name     = $_.Name
+                            Severity = if ($v.severity) { $v.severity } else { "unknown" }
+                            Title    = if ($v.title) { $v.title } else { $_.Name }
+                            Url      = if ($v.url) { $v.url } else { "" }
+                            Fix      = if ($v.fixAvailable) { "Fix available" } else { "No automatic fix" }
+                        }
+                        $vulnCount++
+                    }
+                    Write-Ok "npm audit found $vulnCount dependency vulnerabilities."
+                } else {
+                    Write-Ok "npm audit: no vulnerabilities found."
+                }
+            }
+        } catch {
+            Write-Warn "npm audit failed: $($_.Exception.Message)"
+        }
+    }
+
+    # --- pip audit ---
+    if ($runtime -eq "Python") {
+        if (Test-Command "pip-audit") {
+            Write-Step "Running pip-audit..."
+            try {
+                $pipAuditOutput = & cmd.exe /c "cd /d `"$dir`" && pip-audit --format json 2>nul"
+                if ($pipAuditOutput) {
+                    $pipAuditJson = $pipAuditOutput | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    if ($pipAuditJson) {
+                        foreach ($vuln in $pipAuditJson) {
+                            $results += @{
+                                Tool     = "pip-audit"
+                                Name     = $vuln.name
+                                Severity = if ($vuln.severity) { $vuln.severity } else { "unknown" }
+                                Title    = "$($vuln.name) $($vuln.version) - $($vuln.id)"
+                                Url      = if ($vuln.more_info) { $vuln.more_info } else { "" }
+                                Fix      = if ($vuln.fix_versions) { "Update to: $($vuln.fix_versions -join ', ')" } else { "" }
+                            }
+                        }
+                        Write-Ok "pip-audit found $($pipAuditJson.Count) vulnerabilities."
+                    }
+                }
+            } catch {
+                Write-Warn "pip-audit failed: $($_.Exception.Message)"
+            }
+        } elseif (Test-Command "pip") {
+            Write-Step "Running pip check..."
+            $pipCheckOutput = & cmd.exe /c "cd /d `"$dir`" && pip check 2>nul"
+            if ($LASTEXITCODE -ne 0 -and $pipCheckOutput) {
+                Write-Warn "pip check found issues: $pipCheckOutput"
+            } else {
+                Write-Ok "pip check: no issues found."
+            }
+        }
+    }
+
+    # --- dotnet audit ---
+    if ($runtime -eq ".NET" -and (Test-Command "dotnet")) {
+        Write-Step "Running dotnet list package --vulnerable..."
+        try {
+            $dotnetOutput = & cmd.exe /c "cd /d `"$dir`" && dotnet list package --vulnerable --format json 2>nul"
+            if ($dotnetOutput) {
+                Write-Ok "dotnet vulnerability check complete."
+                # Parse JSON output if available
+                try {
+                    $dotnetJson = $dotnetOutput | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    if ($dotnetJson -and $dotnetJson.projects) {
+                        foreach ($proj in $dotnetJson.projects) {
+                            foreach ($fw in $proj.frameworks) {
+                                foreach ($pkg in $fw.topLevelPackages) {
+                                    if ($pkg.vulnerabilities) {
+                                        foreach ($v in $pkg.vulnerabilities) {
+                                            $results += @{
+                                                Tool     = "dotnet audit"
+                                                Name     = $pkg.id
+                                                Severity = if ($v.severity) { $v.severity } else { "unknown" }
+                                                Title    = "$($pkg.id) $($pkg.resolvedVersion) - $($v.advisoryurl)"
+                                                Url      = if ($v.advisoryurl) { $v.advisoryurl } else { "" }
+                                                Fix      = ""
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch {}
+            }
+        } catch {
+            Write-Warn "dotnet vulnerability check failed."
+        }
+    }
+
+    # --- semgrep (cross-language) ---
+    if (Test-Command "semgrep") {
+        Write-Step "Running semgrep static analysis..."
+        try {
+            $semgrepOutput = & cmd.exe /c "cd /d `"$dir`" && semgrep scan --config auto --json --quiet 2>nul"
+            if ($semgrepOutput) {
+                $semgrepJson = $semgrepOutput | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($semgrepJson -and $semgrepJson.results) {
+                    foreach ($finding in $semgrepJson.results) {
+                        $severity = switch ($finding.extra.severity) {
+                            "ERROR"   { "High" }
+                            "WARNING" { "Medium" }
+                            "INFO"    { "Low" }
+                            default   { "Low" }
+                        }
+                        $results += @{
+                            Tool     = "semgrep"
+                            Name     = $finding.check_id
+                            Severity = $severity
+                            Title    = if ($finding.extra.message) { $finding.extra.message } else { $finding.check_id }
+                            Url      = "$($finding.path):$($finding.start.line)"
+                            Fix      = if ($finding.extra.fix) { $finding.extra.fix } else { "" }
+                        }
+                    }
+                    Write-Ok "semgrep found $($semgrepJson.results.Count) findings."
+                } else {
+                    Write-Ok "semgrep: no findings."
+                }
+            }
+        } catch {
+            Write-Warn "semgrep failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Detail "semgrep not installed. Skipping SAST. Install with: pip install semgrep"
+    }
+
+    $script:StaticAnalysisResults = $results
+    return $results
+}
+
+function New-StaticAnalysisReport {
+    param(
+        [array]$Results,
+        [string]$ReportBasePath,
+        [string]$ProjectDir,
+        [hashtable]$Framework
+    )
+
+    $reportFile = $ReportBasePath
+    $jsonReportPath = [System.IO.Path]::ChangeExtension($reportFile, ".json")
+    $sarifReportPath = [System.IO.Path]::ChangeExtension($reportFile, ".sarif")
+
+    # Count by severity
+    $high   = @($Results | Where-Object { $_.Severity -match "High|high|critical|CRITICAL" }).Count
+    $medium = @($Results | Where-Object { $_.Severity -match "Medium|medium|moderate|MODERATE" }).Count
+    $low    = @($Results | Where-Object { $_.Severity -match "Low|low|INFO|info" }).Count
+
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Green
+    Write-Host "     STATIC ANALYSIS RESULTS" -ForegroundColor Green
+    Write-Host "================================================================" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "    Vulnerability Summary ($($Results.Count) total findings):" -ForegroundColor White
+    Write-Host ""
+    if ($high -gt 0)   { Write-Host "      HIGH:          $high" -ForegroundColor Red }
+    else               { Write-Host "      HIGH:          0" -ForegroundColor Green }
+    if ($medium -gt 0) { Write-Host "      MEDIUM:        $medium" -ForegroundColor Yellow }
+    else               { Write-Host "      MEDIUM:        0" -ForegroundColor Green }
+    if ($low -gt 0)    { Write-Host "      LOW:           $low" -ForegroundColor DarkYellow }
+    else               { Write-Host "      LOW:           0" -ForegroundColor Green }
+    Write-Host ""
+
+    # Detail
+    if ($Results.Count -gt 0) {
+        Write-Step "Findings detail:"
+        Write-Host ""
+        foreach ($r in $Results) {
+            $riskColor = switch -Regex ($r.Severity) {
+                "High|high|critical" { "Red" }
+                "Medium|medium|moderate" { "Yellow" }
+                "Low|low|info" { "DarkYellow" }
+                default { "White" }
+            }
+            $sevLabel = $r.Severity.ToUpper().PadRight(13)
+            Write-Host "    [$sevLabel] " -ForegroundColor $riskColor -NoNewline
+            Write-Host "$($r.Title)" -ForegroundColor White
+            Write-Host "                      Tool: $($r.Tool)" -ForegroundColor DarkGray
+            if ($r.Url) { Write-Host "                      Ref:  $($r.Url)" -ForegroundColor DarkGray }
+            if ($r.Fix) { Write-Host "                      Fix:  $($r.Fix)" -ForegroundColor DarkGray }
+            Write-Host ""
+        }
+    }
+
+    # --- Generate HTML report ---
+    $scanDuration = [math]::Round(((Get-Date) - $script:ScanStartTime).TotalMinutes, 1)
+    $htmlContent = @"
+<!DOCTYPE html>
+<html><head><title>Static Analysis Report</title>
+<style>body{font-family:Arial,sans-serif;margin:20px}h1{color:#333}.high{color:red}.medium{color:orange}.low{color:#999}
+table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f4f4f4}
+.meta{background:#f0f8ff;padding:15px;border-radius:5px;margin-bottom:20px}</style></head><body>
+<h1>Static Analysis Security Report</h1>
+<div class="meta">
+<strong>Scan Metadata</strong><br>
+Project: $ProjectDir<br>
+Framework: $(if ($Framework) { $Framework.Name } else { 'Unknown' })<br>
+Project Type: $($script:ProjectType)<br>
+Scan Mode: static (no live scan)<br>
+Duration: $scanDuration minutes<br>
+Fallbacks: $(if ($script:FallbacksTriggered.Count -gt 0) { $script:FallbacksTriggered -join '; ' } else { 'None' })<br>
+Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')<br>
+</div>
+<h2>Summary: $($Results.Count) findings ($high high, $medium medium, $low low)</h2>
+<table><tr><th>Severity</th><th>Tool</th><th>Name</th><th>Description</th><th>Reference</th><th>Fix</th></tr>
+$( ($Results | ForEach-Object { "<tr><td class='$($_.Severity.ToLower())'>$($_.Severity)</td><td>$($_.Tool)</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.Name))</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.Title))</td><td>$($_.Url)</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.Fix))</td></tr>" }) -join "`n" )
+</table></body></html>
+"@
+    try { Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue } catch {}
+    $htmlContent | Out-File -FilePath $reportFile -Encoding utf8
+    Write-Ok "HTML report saved: $reportFile"
+
+    # --- JSON report ---
+    $jsonOutput = @{
+        scan = @{
+            mode       = "static"
+            projectType = $script:ProjectType
+            framework  = if ($Framework) { $Framework.Name } else { "unknown" }
+            directory  = $ProjectDir
+            timestamp  = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+            duration   = $scanDuration
+            fallbacks  = $script:FallbacksTriggered
+        }
+        summary = @{
+            total  = $Results.Count
+            high   = $high
+            medium = $medium
+            low    = $low
+        }
+        findings = $Results
+    }
+    $jsonOutput | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonReportPath -Encoding utf8
+    Write-Ok "JSON report saved: $jsonReportPath"
+
+    # --- SARIF report ---
+    $sarifRules = @{}
+    $sarifResults = @()
+    foreach ($r in $Results) {
+        $ruleId = "$($r.Tool)-$($r.Name)" -replace '[^a-zA-Z0-9\-\.]', '_'
+        if (-not $sarifRules.ContainsKey($ruleId)) {
+            $sarifRules[$ruleId] = @{
+                id               = $ruleId
+                name             = $r.Name
+                shortDescription = @{ text = $r.Title }
+            }
+        }
+        $level = switch -Regex ($r.Severity) {
+            "High|high|critical" { "error" }
+            "Medium|medium|moderate" { "warning" }
+            default { "note" }
+        }
+        $sarifResults += @{
+            ruleId  = $ruleId
+            level   = $level
+            message = @{ text = $r.Title }
+            locations = @(@{
+                physicalLocation = @{
+                    artifactLocation = @{ uri = if ($r.Url) { $r.Url } else { $ProjectDir } }
+                }
+            })
+        }
+    }
+    $sarif = @{
+        '$schema' = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json"
+        version   = "2.1.0"
+        runs      = @(@{
+            tool = @{
+                driver = @{
+                    name  = "auto-zap static analysis"
+                    rules = @($sarifRules.Values)
+                }
+            }
+            results = $sarifResults
+        })
+    }
+    $sarif | ConvertTo-Json -Depth 15 | Out-File -FilePath $sarifReportPath -Encoding utf8
+    Write-Ok "SARIF report saved: $sarifReportPath"
+
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Magenta
+    Write-Host "     STATIC ANALYSIS COMPLETE" -ForegroundColor Magenta
+    Write-Host "================================================================" -ForegroundColor Magenta
+    Write-Host ""
+    Write-Host "    HTML Report  : $reportFile" -ForegroundColor White
+    Write-Host "    JSON Report  : $jsonReportPath" -ForegroundColor White
+    Write-Host "    SARIF Report : $sarifReportPath" -ForegroundColor White
+    Write-Host "    Total Issues : $($Results.Count) ($high high, $medium medium, $low low)" -ForegroundColor White
+    Write-Host ""
+
+    if ($high -gt 0) {
+        Write-Err "ACTION REQUIRED: $high HIGH severity findings!"
+        return 1
+    }
+    return 0
+}
+
+function Run-Command([string]$Label, [string]$Command, [string]$WorkDir) {
     if (-not $WorkDir) { $WorkDir = $script:OriginalDir }
     Write-Step "$Label`: $Command"
     Write-Detail "Working directory: $WorkDir"
@@ -1691,7 +2586,7 @@ function Invoke-ProjectCommand([string]$Label, [string]$Command, [string]$WorkDi
 # =============================================================
 # PHASE 1: ZAP Context & Technology Configuration
 # =============================================================
-function Set-ZapContext {
+function Configure-ZapContext {
     param(
         [string]$TargetUrl,
         [hashtable]$Framework
@@ -1733,7 +2628,7 @@ function Set-ZapContext {
         try {
             $escaped = [uri]::EscapeDataString($pattern)
             Invoke-ZapApi "/JSON/context/action/excludeFromContext/?contextName=$($script:ZapContextName)&regex=$escaped" | Out-Null
-        } catch { $null = $_ }
+        } catch {}
     }
 
     # Add config-defined exclude patterns
@@ -1743,7 +2638,7 @@ function Set-ZapContext {
                 $escaped = [uri]::EscapeDataString($pattern)
                 Invoke-ZapApi "/JSON/context/action/excludeFromContext/?contextName=$($script:ZapContextName)&regex=$escaped" | Out-Null
                 Write-Detail "Excluded pattern (config): $pattern"
-            } catch { $null = $_ }
+            } catch {}
         }
     }
 
@@ -1814,7 +2709,7 @@ function Set-ZapContext {
                     Write-Warn "Failed to set technology filter: $($_.Exception.Message)"
                     try {
                         Invoke-ZapApi "/JSON/context/action/includeAllContextTechnologies/?contextName=$($script:ZapContextName)" | Out-Null
-                    } catch { $null = $_ }
+                    } catch {}
                 }
             } else {
                 Write-Detail "No matching technologies found in ZAP. Using all technologies."
@@ -1829,11 +2724,11 @@ function Set-ZapContext {
     foreach ($token in $csrfTokens) {
         try {
             Invoke-ZapApi "/JSON/acsrf/action/addOptionToken/?String=$([uri]::EscapeDataString($token))" | Out-Null
-        } catch { $null = $_ }
+        } catch {}
     }
     try {
         Invoke-ZapApi "/JSON/ascan/action/setOptionHandleAntiCSRFTokens/?Boolean=true" | Out-Null
-    } catch { $null = $_ }
+    } catch {}
 
     Write-Ok "ZAP context configured (ID: $($script:ZapContextId))."
 }
@@ -1915,7 +2810,7 @@ function Import-ApiSpec {
                     }
                 }
             }
-        } catch { $null = $_ }
+        } catch {}
     }
 
     Write-Detail "No OpenAPI/Swagger specification found."
@@ -1952,7 +2847,7 @@ function Import-GraphqlSchema {
                     Write-Warn "ZAP failed to import GraphQL schema: $($_.Exception.Message)"
                 }
             }
-        } catch { $null = $_ }
+        } catch {}
     }
 
     Write-Detail "Could not import GraphQL schema automatically."
@@ -1961,7 +2856,7 @@ function Import-GraphqlSchema {
 # =============================================================
 # PHASE 3: Authenticated Scanning
 # =============================================================
-function Set-ZapAuth {
+function Configure-ZapAuth {
     param(
         [string]$TargetUrl,
         [string]$ProjectDir
@@ -2024,7 +2919,7 @@ function Set-ZapAuth {
         foreach ($ep in $loginEndpoints) {
             try {
                 $testUrl = "${TargetUrl}${ep}"
-                $null = Invoke-WebRequest -Uri $testUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                $resp = Invoke-WebRequest -Uri $testUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
                 $loginUrl = $testUrl
                 Write-Detail "Login endpoint found at: $ep"
                 break
@@ -2110,7 +3005,7 @@ function Set-ZapAuth {
 # =============================================================
 # PHASE 4: Scan Policy Configuration
 # =============================================================
-function Set-ScanPolicy {
+function Configure-ScanPolicy {
     param(
         [hashtable]$Framework,
         [bool]$IsFullScan
@@ -2120,7 +3015,7 @@ function Set-ScanPolicy {
     Write-Step "Configuring scan policy..."
 
     # Remove stale policy from prior run (ignore errors if it doesn't exist)
-    try { Invoke-ZapApi "/JSON/ascan/action/removeScanPolicy/?scanPolicyName=$policyName" | Out-Null } catch { $null = $_ }
+    try { Invoke-ZapApi "/JSON/ascan/action/removeScanPolicy/?scanPolicyName=$policyName" | Out-Null } catch {}
     try {
         Invoke-ZapApi "/JSON/ascan/action/addScanPolicy/?scanPolicyName=$policyName" | Out-Null
     } catch {
@@ -2193,14 +3088,14 @@ function Set-ScanPolicy {
     $threads = if ($IsFullScan) { 5 } else { 2 }
     try {
         Invoke-ZapApi "/JSON/ascan/action/setOptionThreadPerHost/?Integer=$threads" | Out-Null
-    } catch { $null = $_ }
+    } catch {}
 
     # Count active rules
     try {
         $scanners = Invoke-ZapApi "/JSON/ascan/view/scanners/?scanPolicyName=$policyName&policyId="
         $enabledCount = ($scanners.scanners | Where-Object { $_.enabled -eq "true" }).Count
         $script:ActiveRuleCount = $enabledCount
-    } catch { $null = $_ }
+    } catch {}
 
     $script:ScanPolicyName = $policyName
     Write-Ok "Scan policy configured: strength=$strength, threshold=$threshold, threads=$threads"
@@ -2387,6 +3282,8 @@ function Write-ScanSummary {
     if ($script:Config) {
         Write-Host "    Config       : .auto-zap.json" -ForegroundColor White
     }
+    Write-Host "    Project Type : $($script:ProjectType)" -ForegroundColor White
+    Write-Host "    Scan Mode    : $($script:EffectiveScanMode)" -ForegroundColor White
     if ($Framework) {
         Write-Host "    Framework    : $($Framework.Name)" -ForegroundColor White
     }
@@ -2457,6 +3354,9 @@ function Write-ScanSummary {
     if ($script:HealthCheckResult) {
         Write-Host "    Health Check : $($script:HealthCheckResult)" -ForegroundColor White
     }
+    if ($script:FallbacksTriggered.Count -gt 0) {
+        Write-Host "    Fallbacks    : $($script:FallbacksTriggered -join '; ')" -ForegroundColor DarkYellow
+    }
 
     Write-Host "    $('-' * 50)" -ForegroundColor DarkGray
     Write-Host ""
@@ -2467,14 +3367,45 @@ function Write-ScanSummary {
 # =============================================================
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Magenta
-Write-Host "     OWASP ZAP - Fully Automated Web Application Scanner       " -ForegroundColor Magenta
+Write-Host "     OWASP ZAP - Fully Automated Security Scanner              " -ForegroundColor Magenta
 Write-Host "================================================================" -ForegroundColor Magenta
 Write-Host ""
 
 # --- Step 0: Check prerequisites ---
 Write-Step "STEP 0: Checking prerequisites..."
+Write-VerboseLog "Working directory: $($script:OriginalDir)"
+Write-VerboseLog "ScanMode: $ScanMode | DryRun: $DryRun | VerboseLog: $VerboseLog"
+
+# Apply configurable timeouts from .auto-zap.json (loaded later, but check early override)
+$configPath = Join-Path $script:OriginalDir ".auto-zap.json"
+if (Test-Path $configPath) {
+    try {
+        $earlyConfig = Get-Content $configPath -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($earlyConfig) {
+            if ($earlyConfig.timeouts) {
+                if ($earlyConfig.timeouts.maxWait)      { $MaxWaitSeconds = [int]$earlyConfig.timeouts.maxWait }
+                if ($earlyConfig.timeouts.appStart)      { $script:AppStartTimeout = [int]$earlyConfig.timeouts.appStart } else { $script:AppStartTimeout = 180 }
+                if ($earlyConfig.timeouts.activeScan)     { $script:ActiveScanTimeout = [int]$earlyConfig.timeouts.activeScan } else { $script:ActiveScanTimeout = 30 }
+                if ($earlyConfig.timeouts.ajaxSpider)     { $script:AjaxSpiderTimeout = [int]$earlyConfig.timeouts.ajaxSpider } else { $script:AjaxSpiderTimeout = 180 }
+                if ($earlyConfig.timeouts.stallDetection)  { $script:StallTimeout = [int]$earlyConfig.timeouts.stallDetection } else { $script:StallTimeout = 300 }
+            } else {
+                $script:AppStartTimeout = 180; $script:ActiveScanTimeout = 30; $script:AjaxSpiderTimeout = 180; $script:StallTimeout = 300
+            }
+        } else {
+            $script:AppStartTimeout = 180; $script:ActiveScanTimeout = 30; $script:AjaxSpiderTimeout = 180; $script:StallTimeout = 300
+        }
+    } catch {
+        $script:AppStartTimeout = 180; $script:ActiveScanTimeout = 30; $script:AjaxSpiderTimeout = 180; $script:StallTimeout = 300
+    }
+} else {
+    $script:AppStartTimeout = 180; $script:ActiveScanTimeout = 30; $script:AjaxSpiderTimeout = 180; $script:StallTimeout = 300
+}
+
+# For static-only scan modes, ZAP is not needed
+$needsZap = ($ScanMode -ne "static")
 
 $canRunLocal = ($null -ne $ZapPath)
+$canRunDocker = $false
 
 # Determine ZAP execution mode
 if ($UseDockerZap) {
@@ -2482,29 +3413,52 @@ if ($UseDockerZap) {
     $canRunLocal = $false  # Force Docker even if local exists
 }
 
-if (-not $canRunLocal -and -not $script:UsingDockerZap) {
-    # No local ZAP found, check if Docker is available as fallback
-    if (Test-Command "docker") {
-        Write-Warn "Local ZAP not found. Checking Docker as fallback..."
-        $null = docker info 2>&1
-        if ($LASTEXITCODE -eq 0) {
+if ($needsZap -and -not $canRunLocal -and -not $script:UsingDockerZap) {
+    # No local ZAP found - try auto-install before falling back to Docker
+    Write-Warn "Local ZAP not found. Attempting auto-install..."
+    if (Install-ZapAutomatic) {
+        $canRunLocal = $true
+        # $ZapPath is set by Install-ZapAutomatic
+        $ZapPath = $script:ZapPath
+    }
+}
+
+if ($needsZap -and -not $canRunLocal -and -not $script:UsingDockerZap) {
+    # Still no local ZAP - check Docker as fallback
+    Write-VerboseLog "No local ZAP after auto-install attempt. Checking Docker..."
+    if (Test-DockerAvailable) {
+        $canRunDocker = $true
+        $script:UsingDockerZap = $true
+        $script:FallbacksTriggered += "ZAP via Docker (local install unavailable)"
+        Write-Ok "Docker available. Will use Docker-based ZAP."
+    } elseif (Test-Command "docker") {
+        # Docker CLI exists but daemon not running - try starting it
+        if (Ensure-DockerRunning) {
+            $canRunDocker = $true
             $script:UsingDockerZap = $true
-            Write-Ok "Docker available. Will use Docker-based ZAP."
+            $script:FallbacksTriggered += "ZAP via Docker (started Docker Desktop)"
+            Write-Ok "Docker started. Will use Docker-based ZAP."
         }
     }
 }
 
-if (-not $canRunLocal -and -not $script:UsingDockerZap) {
+if ($needsZap -and -not $canRunLocal -and -not $script:UsingDockerZap) {
     Write-Err "OWASP ZAP is not installed and Docker is not available."
-    Write-Err "    Auto-ZAP needs either a local ZAP installation or Docker to run ZAP in a container."
+    Write-Err "    Auto-ZAP tried: winget install, scoop install, standalone JAR download, Docker."
     Write-Err "    Fix: Install ZAP with: winget install ZAP.ZAP"
     Write-Err "         Or install Docker: winget install Docker.DockerDesktop"
+    Write-Err "         Or install Java + rerun (will download ZAP JAR automatically)"
+    Write-Err "         Or use -ScanMode static for dependency-only analysis."
     Write-Err "         Or use -Url to scan a running app with an external ZAP instance."
     exit 1
 }
 
+if (-not $needsZap) {
+    Write-Ok "Static scan mode - ZAP not required."
+}
+
 # Load .auto-zap.json config
-Import-AutoZapConfig
+Load-AutoZapConfig
 
 # Dynamic ZAP port allocation
 $zapPortInUse = Get-NetTCPConnection -LocalPort $ZapApiPort -ErrorAction SilentlyContinue |
@@ -2542,19 +3496,75 @@ $appPort = 0
 if (-not $TargetUrl) {
     # --- Step 1: Detect framework ---
     Write-Step "STEP 1: Detecting web app framework..."
-    $framework = Get-AppFramework
+    $framework = Detect-AppFramework
 
     if (-not $framework) {
-        Write-Err "Could not detect a web application in $($script:OriginalDir)"
-        Write-Err "    Auto-ZAP checks for: package.json, requirements.txt, pyproject.toml, *.csproj, pom.xml, build.gradle,"
-        Write-Err "                        Gemfile, go.mod, Cargo.toml, mix.exs, deno.json, bunfig.toml, Dockerfile, index.html"
-        Write-Err "    Fix: Create .auto-zap.json with `"command`" and `"port`" to configure manually."
-        Write-Err "         Or use -Url to scan an already-running app: .\auto-zap.ps1 -Url http://localhost:8080"
-        exit 1
+        # Even without a framework, we can still do static analysis
+        if ($ScanMode -eq "static" -or $ScanMode -eq "auto") {
+            Write-Warn "No web framework detected in $($script:OriginalDir)."
+            Write-Warn "Falling back to static analysis mode."
+            $script:ProjectType = "library"
+            $script:EffectiveScanMode = "static"
+        } else {
+            Write-Err "Could not detect a web application in $($script:OriginalDir)"
+            Write-Err "    Auto-ZAP checks for: package.json, requirements.txt, pyproject.toml, *.csproj, pom.xml, build.gradle,"
+            Write-Err "                        Gemfile, go.mod, Cargo.toml, mix.exs, deno.json, bunfig.toml, Dockerfile, index.html"
+            Write-Err "    Fix: Create .auto-zap.json with `"command`" and `"port`" to configure manually."
+            Write-Err "         Or use -Url to scan an already-running app: .\auto-zap.ps1 -Url http://localhost:8080"
+            Write-Err "         Or use -ScanMode static for dependency-only analysis."
+            exit 1
+        }
+    }
+
+    # Classify project type
+    if ($framework) {
+        $script:ProjectType = Get-ProjectType -Framework $framework -ProjectDir $script:OriginalDir
+    }
+    # Resolve effective scan mode
+    if ($ScanMode -eq "auto") {
+        $script:EffectiveScanMode = switch ($script:ProjectType) {
+            "webapp"   { "webapp" }
+            "api-only" { "api" }
+            "library"  { "static" }
+            "cli"      { "static" }
+            "worker"   { "static" }
+            default    { "webapp" }
+        }
+        Write-VerboseLog "Auto-detected scan mode: $($script:EffectiveScanMode) (project type: $($script:ProjectType))"
+    }
+    Write-Ok "Project type: $($script:ProjectType) | Scan mode: $($script:EffectiveScanMode)"
+
+    # --- For static-only projects, run static analysis and exit early ---
+    if ($script:EffectiveScanMode -eq "static") {
+        Write-Host ""
+        Write-Step "Project classified as '$($script:ProjectType)' - no live server needed."
+        Write-Step "Running static analysis only..."
+
+        # Still install dependencies for accurate audit
+        if (-not $SkipInstall -and $framework -and $framework.Install) {
+            if ($framework.Runtime -eq "Node.js") {
+                $pm = Get-NodePackageManager
+                Ensure-PackageManager $pm.Name | Out-Null
+            }
+            $installDirForStatic = if ($framework.InstallDir) { $framework.InstallDir } else { $script:OriginalDir }
+            Run-Command "Install" $framework.Install $installDirForStatic | Out-Null
+        }
+
+        if ($DryRun) {
+            Write-DryRun "Would run static analysis tools (npm audit, pip-audit, semgrep, etc.)"
+            Write-DryRun "Would generate reports at: $ReportPath"
+            exit 0
+        }
+
+        $staticResults = Run-StaticAnalysis -Framework $framework -ProjectDir $script:OriginalDir
+        $reportFile = if ([System.IO.Path]::IsPathRooted($ReportPath)) { $ReportPath } else { Join-Path $script:ProjectRoot $ReportPath }
+        $staticExitCode = New-StaticAnalysisReport -Results $staticResults -ReportBasePath $reportFile -ProjectDir $script:OriginalDir -Framework $framework
+        Cleanup
+        exit $staticExitCode
     }
 
     # Apply config overrides (config > auto-detection, CLI params > config)
-    if ($script:Config) {
+    if ($script:Config -and $framework) {
         if ($script:Config.command -and -not $Port) {
             $framework.Command = $script:Config.command
             Write-Detail "Start command overridden by config: $($script:Config.command)"
@@ -2584,7 +3594,7 @@ if (-not $TargetUrl) {
         Write-Detail "CLI -Port overrides config port"
     }
 
-    $appPort = if ($Port -gt 0) { $Port } else { $framework.Port }
+    $appPort = if ($Port -gt 0) { $Port } else { if ($framework) { $framework.Port } else { 3000 } }
     $TargetUrl = "http://localhost:$appPort"
 
     # Apply auth config overrides (config values used as defaults, CLI params override)
@@ -2602,7 +3612,7 @@ if (-not $TargetUrl) {
     Write-Host ""
 
     # Load .env files into process environment so tools like Prisma can find DATABASE_URL etc.
-    $envCount = Import-EnvFile
+    $envCount = Import-EnvFiles
 
     # Check for PORT env var (many apps respect this, especially Node.js and Python)
     if (-not $Port) {
@@ -2625,13 +3635,13 @@ if (-not $TargetUrl) {
     $composeHandledDb = $false
     if ($script:Config -and $script:Config.compose) {
         Write-Step "STEP 2: Starting Docker Compose services..."
-        $composeHandledDb = Start-ComposeService
+        $composeHandledDb = Start-ComposeServices
     }
 
     if ($framework.NeedsDb -and -not $composeHandledDb) {
         Write-Step "STEP 2: Ensuring database is running..."
         $dbConfig = Get-DatabaseConfig
-        if (-not (Initialize-Database)) {
+        if (-not (Ensure-Database)) {
             $dbType = if ($dbConfig) { $dbConfig.Type } else { "unknown" }
             $dbPort = if ($dbConfig) { $dbConfig.Port } else { "unknown" }
             Write-Err "Database ($dbType) required but not reachable on port $dbPort, and Docker is not available."
@@ -2641,13 +3651,13 @@ if (-not $TargetUrl) {
             exit 1
         }
         # Also check for Redis
-        Initialize-RedisCache
+        Ensure-Redis
         # Give DB a moment to accept queries after TCP is open
         Start-Sleep -Seconds 3
     } elseif (-not $composeHandledDb) {
         Write-Step "STEP 2: No database needed. Skipping."
         # Still check for Redis (some apps use it for caching/sessions)
-        Initialize-RedisCache
+        Ensure-Redis
     }
     Sync-Manifest
     Write-Host ""
@@ -2656,7 +3666,7 @@ if (-not $TargetUrl) {
     # Ensure the package manager is available before installing
     if ($framework.Runtime -eq "Node.js") {
         $pm = Get-NodePackageManager
-        if (-not (Test-PackageManager $pm.Name)) {
+        if (-not (Ensure-PackageManager $pm.Name)) {
             Cleanup
             exit 1
         }
@@ -2665,7 +3675,7 @@ if (-not $TargetUrl) {
     if (-not $SkipInstall -and $framework.Install) {
         Write-Step "STEP 3: Installing dependencies..."
         $installDir = if ($framework.InstallDir) { $framework.InstallDir } else { $script:OriginalDir }
-        $installResult = Invoke-ProjectCommand "Install" $framework.Install $installDir
+        $installResult = Run-Command "Install" $framework.Install $installDir
         if (-not $installResult) {
             Write-Err "Dependency installation failed: $($framework.Install)"
             Write-Err "    Fix: Run '$($framework.Install)' manually to see the full error."
@@ -2686,7 +3696,7 @@ if (-not $TargetUrl) {
     if ($framework.Migrations -and $framework.Migrations.Count -gt 0) {
         Write-Step "STEP 4: Running database migrations..."
         foreach ($migration in $framework.Migrations) {
-            $migResult = Invoke-ProjectCommand "Migration" $migration
+            $migResult = Run-Command "Migration" $migration
             if (-not $migResult) {
                 Write-Err "Migration failed: $migration"
                 Write-Err "    Fix: Run '$migration' manually to debug."
@@ -2706,7 +3716,7 @@ if (-not $TargetUrl) {
         Write-Step "STEP 4b: Running pre-start hooks..."
         foreach ($hook in $script:Config.preStart) {
             Write-Step "Pre-start: $hook"
-            $hookResult = Invoke-ProjectCommand "Pre-start" $hook
+            $hookResult = Run-Command "Pre-start" $hook
             if (-not $hookResult) {
                 Write-Err "Pre-start hook failed: $hook"
                 Write-Err "    Fix: Run '$hook' manually to debug."
@@ -2720,8 +3730,42 @@ if (-not $TargetUrl) {
     Write-Host ""
 
     # --- Step 4c: Start background services ---
-    Start-BackgroundService
+    Start-BackgroundServices
     Write-Host ""
+
+    # --- DryRun check ---
+    if ($DryRun) {
+        Write-Host ""
+        Write-DryRun "=== DRY RUN SUMMARY ==="
+        Write-DryRun "Project type    : $($script:ProjectType)"
+        Write-DryRun "Scan mode       : $($script:EffectiveScanMode)"
+        Write-DryRun "Framework       : $(if ($framework) { $framework.Name } else { 'None' })"
+        Write-DryRun "Start command   : $(if ($framework) { $framework.Command } else { 'N/A' })"
+        Write-DryRun "Target URL      : $TargetUrl"
+        Write-DryRun "ZAP mode        : $(if ($script:UsingDockerZap) { 'Docker' } else { 'Local' })"
+        Write-DryRun "Database        : $(if ($script:DetectedDbType) { $script:DetectedDbType } else { 'None' })"
+        Write-DryRun "Auth            : $(if ($AuthUser -or $AuthToken) { 'Yes' } else { 'None' })"
+        Write-DryRun "Full scan       : $($FullScan.IsPresent)"
+        if ($script:FallbacksTriggered.Count -gt 0) {
+            Write-DryRun "Fallbacks       : $($script:FallbacksTriggered -join '; ')"
+        }
+        Write-DryRun ""
+        Write-DryRun "Would execute:"
+        Write-DryRun "  1. Start app: $($framework.Command)"
+        Write-DryRun "  2. Start ZAP on port $ZapApiPort"
+        Write-DryRun "  3. Configure context + technology filter"
+        Write-DryRun "  4. Import API specs (if found)"
+        if ($script:EffectiveScanMode -ne "api") {
+            Write-DryRun "  5. Run spider + ajax spider"
+        } else {
+            Write-DryRun "  5. Skip spider (API-only mode) - use OpenAPI import"
+        }
+        Write-DryRun "  6. Run active vulnerability scan"
+        Write-DryRun "  7. Generate reports: $ReportPath (.html, .json, .sarif)"
+        Write-DryRun "  8. Cleanup all processes"
+        Cleanup
+        exit 0
+    }
 
     # --- Step 5: Start the web app ---
     Write-Step "STEP 5: Starting web application..."
@@ -2752,8 +3796,8 @@ if (-not $TargetUrl) {
     Write-Detail "Launch command: cmd.exe /c $($framework.Command)"
     $script:AppProcess = Start-Process -FilePath "cmd.exe" -ArgumentList "/c $($framework.Command)" -WorkingDirectory $script:OriginalDir -PassThru -WindowStyle Minimized
 
-    if (-not (Wait-ForUrl $TargetUrl -TimeoutSec 180 -Label $framework.Name)) {
-        Write-Err "Application did not start within 180 seconds at $TargetUrl."
+    if (-not (Wait-ForUrl $TargetUrl -TimeoutSec $script:AppStartTimeout -Label $framework.Name)) {
+        Write-Err "Application did not start within $($script:AppStartTimeout) seconds at $TargetUrl."
         Write-Err "    Check the application's console window for error messages."
         Write-Err "    Fix: Run '$($framework.Command)' manually to debug."
         Write-Err "         Common causes: missing environment variables, port already in use, build errors."
@@ -2773,10 +3817,10 @@ if (-not $TargetUrl) {
     }
 
     # Try to detect framework for configuration even with -Url
-    try { $framework = Get-AppFramework } catch { $null = $_ }
+    try { $framework = Detect-AppFramework } catch {}
 
     # Parse port from URL
-    try { $appPort = ([uri]$TargetUrl).Port } catch { $null = $_ }
+    try { $appPort = ([uri]$TargetUrl).Port } catch {}
 }
 Write-Host ""
 
@@ -2795,7 +3839,7 @@ if ($script:UsingDockerZap) {
     Write-Step "STEP 6: Starting OWASP ZAP via Docker on port $ZapApiPort ..."
 
     # Ensure Docker is running
-    if (-not (Test-DockerRunning)) {
+    if (-not (Ensure-DockerRunning)) {
         Write-Err "Docker is not available. Cannot start ZAP."
         Cleanup
         exit 1
@@ -2804,9 +3848,21 @@ if ($script:UsingDockerZap) {
     # Remove any existing container
     docker rm -f $script:ZapDockerContainer 2>$null | Out-Null
 
-    # Pull image if needed
+    # Pull image if needed (with retry)
     Write-Detail "Pulling ZAP Docker image (if needed)..."
-    docker pull ghcr.io/zaproxy/zaproxy:stable 2>&1 | Out-Null
+    $pullSuccess = $false
+    for ($pullAttempt = 1; $pullAttempt -le 3; $pullAttempt++) {
+        docker pull ghcr.io/zaproxy/zaproxy:stable 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $pullSuccess = $true; break }
+        if ($pullAttempt -lt 3) {
+            Write-VerboseLog "Docker pull attempt $pullAttempt failed. Retrying in 5s..."
+            Start-Sleep -Seconds 5
+        }
+    }
+    if (-not $pullSuccess) {
+        Write-Warn "Docker pull failed after 3 attempts. Trying to use cached image..."
+        $script:FallbacksTriggered += "Docker pull failed - using cached image"
+    }
 
     # Start ZAP container
     $reportAbsDir = if ([System.IO.Path]::IsPathRooted($ReportPath)) {
@@ -2873,7 +3929,7 @@ Write-Host ""
 
 # --- Step 7: Configure ZAP context & technology ---
 Write-Step "STEP 7: Configuring ZAP context and technology..."
-Set-ZapContext -TargetUrl $ZapTargetUrl -Framework $framework
+Configure-ZapContext -TargetUrl $ZapTargetUrl -Framework $framework
 Write-Host ""
 
 # --- Step 8: Import API specs ---
@@ -2884,12 +3940,12 @@ Write-Host ""
 
 # --- Step 9: Configure authentication ---
 Write-Step "STEP 9: Configuring authentication..."
-Set-ZapAuth -TargetUrl $TargetUrl -ProjectDir $script:OriginalDir
+Configure-ZapAuth -TargetUrl $TargetUrl -ProjectDir $script:OriginalDir
 Write-Host ""
 
 # --- Step 10: Configure scan policy ---
 Write-Step "STEP 10: Configuring scan policy..."
-Set-ScanPolicy -Framework $framework -IsFullScan $FullScan.IsPresent
+Configure-ScanPolicy -Framework $framework -IsFullScan $FullScan.IsPresent
 Write-Host ""
 
 # --- Pre-scan summary ---
@@ -2909,55 +3965,103 @@ $userParam = ""
 if ($script:ZapContextName) { $contextParam = "&contextName=$([uri]::EscapeDataString($script:ZapContextName))" }
 if ($script:ZapUserId -ge 0 -and $script:AuthResult) { $userParam = "&userId=$($script:ZapUserId)" }
 
-# --- Phase 1: Spider ---
-Write-Step "Phase 1/3: Spidering (crawling the application)..."
-$spiderUrl = [uri]::EscapeDataString($ZapTargetUrl)
-$spiderResp = Invoke-ZapApi "/JSON/spider/action/scan/?url=$spiderUrl&maxChildren=0&recurse=true&subtreeOnly=false$contextParam$userParam"
-$spiderId = $spiderResp.scan
-
-do {
-    Start-Sleep -Seconds 3
-    $spiderStatus = [string](Invoke-ZapApi "/JSON/spider/view/status/?scanId=$spiderId").status
-    Write-Host "`r    Spider progress: $($spiderStatus.PadLeft(3))%" -NoNewline
-} while ([int]$spiderStatus -lt 100)
-Write-Host ""
-
-$urls = (Invoke-ZapApi "/JSON/spider/view/results/?scanId=$spiderId").results
 $urlCount = 0
-if ($urls) { $urlCount = $urls.Count }
-Write-Ok "Spider complete. Discovered $urlCount URLs."
-Write-Host ""
+$ajaxResults = 0
 
-# --- Phase 2: Ajax Spider ---
-Write-Step "Phase 2/3: Ajax spider (JavaScript-rendered content)..."
-try {
-    $ajaxUrl = [uri]::EscapeDataString($ZapTargetUrl)
-    if ($script:ZapUserId -ge 0 -and $script:AuthResult -and $script:ZapContextId) {
-        Invoke-ZapApi "/JSON/ajaxSpider/action/scanAsUser/?contextId=$($script:ZapContextId)&userId=$($script:ZapUserId)&url=$ajaxUrl&subtreeOnly=false" | Out-Null
-    } else {
-        Invoke-ZapApi "/JSON/ajaxSpider/action/scan/?url=$ajaxUrl$contextParam" | Out-Null
+if ($script:EffectiveScanMode -eq "api") {
+    # --- API-only mode: skip spider, rely on OpenAPI/Swagger import ---
+    Write-Step "Phase 1/3: Skipping spider (API-only scan mode)"
+    Write-Detail "API endpoints were imported via OpenAPI/Swagger spec (if found)."
+    if (-not $script:ApiSpecSource) {
+        Write-Warn "No API spec was found. The active scan will have limited coverage."
+        Write-Warn "For better API scan coverage, add an OpenAPI spec (openapi.json/swagger.json)"
+        Write-Warn "  or ensure the app exposes /swagger.json, /api-docs, or /v3/api-docs."
+
+        # Attempt to discover API endpoints by probing common patterns
+        Write-Step "Probing common API endpoint patterns..."
+        $apiProbePaths = @("/api", "/api/v1", "/api/v2", "/v1", "/v2", "/health", "/status", "/api/health")
+        foreach ($probePath in $apiProbePaths) {
+            try {
+                $probeUrl = "${TargetUrl}${probePath}"
+                $resp = Invoke-WebRequest -Uri $probeUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                if ($resp.StatusCode -eq 200) {
+                    # Seed ZAP with discovered API endpoint
+                    $escapedProbeUrl = [uri]::EscapeDataString($(if ($script:UsingDockerZap) { $probeUrl -replace "localhost", "host.docker.internal" } else { $probeUrl }))
+                    try { Invoke-ZapApi "/JSON/core/action/accessUrl/?url=$escapedProbeUrl&followRedirects=true" | Out-Null } catch {}
+                    Write-Detail "Discovered API endpoint: $probePath"
+                    $urlCount++
+                }
+            } catch {
+                if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -ne 404) {
+                    $escapedProbeUrl = [uri]::EscapeDataString($(if ($script:UsingDockerZap) { "${TargetUrl}${probePath}" -replace "localhost", "host.docker.internal" } else { "${TargetUrl}${probePath}" }))
+                    try { Invoke-ZapApi "/JSON/core/action/accessUrl/?url=$escapedProbeUrl&followRedirects=true" | Out-Null } catch {}
+                    Write-Detail "Discovered API endpoint: $probePath (HTTP $([int]$_.Exception.Response.StatusCode))"
+                    $urlCount++
+                }
+            }
+        }
+        Write-Ok "Probed $urlCount API endpoints."
     }
-    $ajaxTimeout = 180
-    $ajaxElapsed = 0
-    do {
-        Start-Sleep -Seconds 5
-        $ajaxElapsed += 5
-        $ajaxStatus = (Invoke-ZapApi "/JSON/ajaxSpider/view/status/").status
-        Write-Host "`r    Ajax spider: $ajaxStatus ($($ajaxElapsed)s)" -NoNewline
-    } while ($ajaxStatus -eq "running" -and $ajaxElapsed -lt $ajaxTimeout)
+    Write-Host ""
+    Write-Step "Phase 2/3: Skipping ajax spider (API-only scan mode)"
+    Write-Host ""
+} else {
+    # --- Phase 1: Spider ---
+    Write-Step "Phase 1/3: Spidering (crawling the application)..."
+    try {
+        $spiderUrl = [uri]::EscapeDataString($ZapTargetUrl)
+        $spiderResp = Invoke-ZapApi "/JSON/spider/action/scan/?url=$spiderUrl&maxChildren=0&recurse=true&subtreeOnly=false$contextParam$userParam"
+        $spiderId = $spiderResp.scan
 
-    if ($ajaxStatus -eq "running") {
-        Invoke-ZapApi "/JSON/ajaxSpider/action/stop/" | Out-Null
-        Write-Warn "Ajax spider timed out after $($ajaxTimeout)s. Continuing with results so far."
+        do {
+            Start-Sleep -Seconds 3
+            $spiderStatus = [string](Invoke-ZapApi "/JSON/spider/view/status/?scanId=$spiderId").status
+            Write-Host "`r    Spider progress: $($spiderStatus.PadLeft(3))%" -NoNewline
+        } while ([int]$spiderStatus -lt 100)
+        Write-Host ""
+
+        $urls = (Invoke-ZapApi "/JSON/spider/view/results/?scanId=$spiderId").results
+        if ($urls) { $urlCount = $urls.Count }
+        Write-Ok "Spider complete. Discovered $urlCount URLs."
+    } catch {
+        Write-Warn "Spider failed: $($_.Exception.Message). Continuing with partial results."
+        $script:FallbacksTriggered += "Spider failed - continuing"
     }
     Write-Host ""
 
-    $ajaxResults = (Invoke-ZapApi "/JSON/ajaxSpider/view/numberOfResults/").numberOfResults
-    Write-Ok "Ajax spider complete. Found $ajaxResults additional resources."
-} catch {
-    Write-Warn "Ajax spider unavailable (needs browser add-on). Skipping."
+    # --- Phase 2: Ajax Spider ---
+    Write-Step "Phase 2/3: Ajax spider (JavaScript-rendered content)..."
+    try {
+        $ajaxUrl = [uri]::EscapeDataString($ZapTargetUrl)
+        if ($script:ZapUserId -ge 0 -and $script:AuthResult -and $script:ZapContextId) {
+            Invoke-ZapApi "/JSON/ajaxSpider/action/scanAsUser/?contextId=$($script:ZapContextId)&userId=$($script:ZapUserId)&url=$ajaxUrl&subtreeOnly=false" | Out-Null
+        } else {
+            Invoke-ZapApi "/JSON/ajaxSpider/action/scan/?url=$ajaxUrl$contextParam" | Out-Null
+        }
+        $ajaxTimeout = $script:AjaxSpiderTimeout
+        $ajaxElapsed = 0
+        do {
+            Start-Sleep -Seconds 5
+            $ajaxElapsed += 5
+            $ajaxStatus = (Invoke-ZapApi "/JSON/ajaxSpider/view/status/").status
+            Write-Host "`r    Ajax spider: $ajaxStatus ($($ajaxElapsed)s)" -NoNewline
+        } while ($ajaxStatus -eq "running" -and $ajaxElapsed -lt $ajaxTimeout)
+
+        if ($ajaxStatus -eq "running") {
+            Invoke-ZapApi "/JSON/ajaxSpider/action/stop/" | Out-Null
+            Write-Warn "Ajax spider timed out after $($ajaxTimeout)s. Continuing with results so far."
+            $script:FallbacksTriggered += "Ajax spider timed out"
+        }
+        Write-Host ""
+
+        $ajaxResults = (Invoke-ZapApi "/JSON/ajaxSpider/view/numberOfResults/").numberOfResults
+        Write-Ok "Ajax spider complete. Found $ajaxResults additional resources."
+    } catch {
+        Write-Warn "Ajax spider unavailable or failed. Continuing without it."
+        $script:FallbacksTriggered += "Ajax spider unavailable"
+    }
+    Write-Host ""
 }
-Write-Host ""
 
 # --- Phase 3: Active Scan ---
 $scanLabel = "Phase 3/3: Active vulnerability scan"
@@ -2973,8 +4077,8 @@ $scanResp = Invoke-ZapApi "/JSON/ascan/action/scan/?url=$scanUrl&recurse=true&in
 $scanId = $scanResp.scan
 
 $scanStart = Get-Date
-$maxScanMinutes = if ($FullScan) { 60 } else { 30 }
-$stallTimeoutSec = 300
+$maxScanMinutes = if ($FullScan) { 60 } else { $script:ActiveScanTimeout }
+$stallTimeoutSec = $script:StallTimeout
 $lastProgress = 0
 $lastProgressTime = Get-Date
 do {
@@ -2995,7 +4099,7 @@ do {
     if ($stallElapsed -ge $stallTimeoutSec) {
         Write-Host ""
         Write-Warn "Active scan stalled at $currentProgress% for $([math]::Round($stallElapsed / 60, 1)) min. Stopping scan."
-        try { Invoke-ZapApi "/JSON/ascan/action/stop/?scanId=$scanId" | Out-Null } catch { $null = $_ }
+        try { Invoke-ZapApi "/JSON/ascan/action/stop/?scanId=$scanId" | Out-Null } catch {}
         break
     }
 
@@ -3003,7 +4107,7 @@ do {
     if ($elapsed -ge $maxScanMinutes) {
         Write-Host ""
         Write-Warn "Active scan reached $maxScanMinutes min timeout at $currentProgress%. Stopping scan."
-        try { Invoke-ZapApi "/JSON/ascan/action/stop/?scanId=$scanId" | Out-Null } catch { $null = $_ }
+        try { Invoke-ZapApi "/JSON/ascan/action/stop/?scanId=$scanId" | Out-Null } catch {}
         break
     }
 } while ($currentProgress -lt 100)
@@ -3091,10 +4195,34 @@ $reportHtml = Invoke-RestMethod "http://localhost:$ZapApiPort/OTHER/core/other/h
 $reportHtml | Out-File -FilePath $reportFile -Encoding utf8
 Write-Ok "Report saved: $reportFile"
 
-# Also generate JSON report for CI/CD integration
+# Also generate JSON report for CI/CD integration (with scan metadata)
 $jsonReportPath = [System.IO.Path]::ChangeExtension($reportFile, ".json")
 $jsonAlerts = (Invoke-ZapApi "/JSON/alert/view/alerts/?baseurl=$resultsUrl&start=0&count=500")
-$jsonAlerts | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonReportPath -Encoding utf8
+$totalScanTimeForJson = [math]::Round(((Get-Date) - $script:ScanStartTime).TotalMinutes, 1)
+$jsonReport = @{
+    metadata = @{
+        projectType  = $script:ProjectType
+        scanMode     = $script:EffectiveScanMode
+        framework    = if ($framework) { $framework.Name } else { "unknown" }
+        targetUrl    = $TargetUrl
+        zapSource    = if ($script:UsingDockerZap) { "docker" } else { "local" }
+        timestamp    = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+        totalTime    = $totalScanTimeForJson
+        urlsFound    = $urlCount
+        apiSpec      = $script:ApiSpecSource
+        fallbacks    = $script:FallbacksTriggered
+        auth         = if ($script:AuthResult) { $script:AuthResult.Type } else { "none" }
+    }
+    summary = @{
+        total         = $total
+        high          = $high
+        medium        = $medium
+        low           = $low
+        informational = $info
+    }
+    alerts = $jsonAlerts.alerts
+}
+$jsonReport | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonReportPath -Encoding utf8
 Write-Ok "JSON report saved: $jsonReportPath"
 
 # Generate SARIF report
@@ -3103,7 +4231,8 @@ New-SarifReport -OutputPath $sarifReportPath -TargetUrl $ZapTargetUrl -Alerts $j
 
 Write-Host ""
 
-# --- Final summary ---
+# --- Final summary with scan metadata ---
+$totalScanTime = [math]::Round(((Get-Date) - $script:ScanStartTime).TotalMinutes, 1)
 Write-Host "================================================================" -ForegroundColor Magenta
 Write-Host "     SCAN COMPLETE" -ForegroundColor Magenta
 Write-Host "================================================================" -ForegroundColor Magenta
@@ -3118,6 +4247,18 @@ if ($script:AuthResult) {
 }
 if ($script:ApiSpecSource) {
     Write-Host "    API Spec     : $($script:ApiSpecSource)" -ForegroundColor White
+}
+Write-Host ""
+Write-Host "    --- Scan Metadata ---" -ForegroundColor DarkGray
+Write-Host "    Project Type : $($script:ProjectType)" -ForegroundColor DarkGray
+Write-Host "    Scan Mode    : $($script:EffectiveScanMode)" -ForegroundColor DarkGray
+Write-Host "    Total Time   : $totalScanTime minutes" -ForegroundColor DarkGray
+if ($framework) {
+    Write-Host "    Framework    : $($framework.Name)" -ForegroundColor DarkGray
+}
+Write-Host "    ZAP Source   : $(if ($script:UsingDockerZap) { 'Docker' } else { 'Local' })" -ForegroundColor DarkGray
+if ($script:FallbacksTriggered.Count -gt 0) {
+    Write-Host "    Fallbacks    : $($script:FallbacksTriggered -join '; ')" -ForegroundColor DarkYellow
 }
 Write-Host ""
 
