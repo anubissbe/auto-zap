@@ -32,3 +32,10 @@ generate_*.py
 build/staging/
 build/*.pfx
 dist/
+
+# Test app artifacts
+test-apps/results/*.log
+test-apps/results/*.txt
+test-apps/**/node_modules/
+test-apps/**/.venv/
+test-apps/**/db.sqlite3

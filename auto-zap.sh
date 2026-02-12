@@ -488,7 +488,12 @@ else
 
     # --- Python ---
     elif [[ -f "manage.py" ]]; then
-        FRAMEWORK="Python - Django"; RUNTIME="Python"; APP_PORT=8000; START_COMMAND="python manage.py runserver 0.0.0.0:8000"
+        FRAMEWORK="Python - Django"; RUNTIME="Python"; APP_PORT=8000
+        if command -v python3 &>/dev/null; then
+            START_COMMAND="python3 manage.py runserver 0.0.0.0:8000"
+        else
+            START_COMMAND="python manage.py runserver 0.0.0.0:8000"
+        fi
     elif [[ -f "pyproject.toml" ]] && grep -q "fastapi" pyproject.toml 2>/dev/null; then
         FRAMEWORK="Python - FastAPI"; RUNTIME="Python"; APP_PORT=8000; START_COMMAND="uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
     elif [[ -f "requirements.txt" ]] && grep -qi "fastapi" requirements.txt 2>/dev/null; then
@@ -496,7 +501,12 @@ else
     elif [[ -f "requirements.txt" ]] && grep -qi "flask" requirements.txt 2>/dev/null; then
         FRAMEWORK="Python - Flask"; RUNTIME="Python"; APP_PORT=5000; START_COMMAND="flask run --host 0.0.0.0"
     elif [[ -f "requirements.txt" ]] || [[ -f "pyproject.toml" ]]; then
-        FRAMEWORK="Python"; RUNTIME="Python"; APP_PORT=8000; START_COMMAND="python app.py"
+        FRAMEWORK="Python"; RUNTIME="Python"; APP_PORT=8000
+        if command -v python3 &>/dev/null; then
+            START_COMMAND="python3 app.py"
+        else
+            START_COMMAND="python app.py"
+        fi
 
     # --- .NET ---
     elif ls ./*.csproj &>/dev/null 2>&1; then
@@ -717,6 +727,16 @@ else
                 log_warn "Dependency installation had errors (continuing anyway)."
             fi
         elif [[ -f "requirements.txt" ]]; then
+            # Use venv if not already in one (avoids PEP 668 externally-managed-environment)
+            if [[ -z "${VIRTUAL_ENV:-}" && ! -d ".venv" ]]; then
+                log_detail "Creating Python virtual environment..."
+                python3 -m venv .venv 2>&1 || log_warn "Failed to create venv."
+            fi
+            if [[ -d ".venv" && -z "${VIRTUAL_ENV:-}" ]]; then
+                # shellcheck disable=SC1091
+                source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate 2>/dev/null || true
+                log_detail "Activated venv at .venv"
+            fi
             pip install -r requirements.txt -q 2>&1 || log_warn "pip install had errors."
         elif [[ -f "pyproject.toml" ]]; then
             if command -v poetry &>/dev/null; then
@@ -724,6 +744,15 @@ else
             elif command -v uv &>/dev/null; then
                 uv sync 2>&1 || log_warn "uv sync had errors."
             else
+                # Use venv if not already in one
+                if [[ -z "${VIRTUAL_ENV:-}" && ! -d ".venv" ]]; then
+                    log_detail "Creating Python virtual environment..."
+                    python3 -m venv .venv 2>&1 || log_warn "Failed to create venv."
+                fi
+                if [[ -d ".venv" && -z "${VIRTUAL_ENV:-}" ]]; then
+                    # shellcheck disable=SC1091
+                    source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate 2>/dev/null || true
+                fi
                 pip install -e . -q 2>&1 || log_warn "pip install had errors."
             fi
         elif ls ./*.csproj &>/dev/null 2>&1; then

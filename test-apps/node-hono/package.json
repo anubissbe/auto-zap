@@ -1,0 +1,11 @@
+{
+  "name": "test-node-hono",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "hono": "^4.0.0",
+    "@hono/node-server": "^1.13.0"
+  }
+}
