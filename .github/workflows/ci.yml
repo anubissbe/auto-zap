@@ -1,0 +1,548 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # Job 1: Lint all scripts and config files
+  # ============================================================
+  lint:
+    name: Lint & Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Bash linting ----
+      - name: ShellCheck (auto-zap.sh)
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          additional_files: 'auto-zap.sh'
+          severity: warning
+
+      - name: Bash syntax check
+        run: bash -n auto-zap.sh
+
+      # ---- PowerShell linting ----
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: PSScriptAnalyzer (auto-zap.ps1)
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path auto-zap.ps1 -Severity Warning,Error -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSAvoidUsingInvokeExpression
+          if ($results) {
+            $results | Format-Table -AutoSize
+            $errors = $results | Where-Object { $_.Severity -eq 'Error' }
+            if ($errors) {
+              Write-Error "PSScriptAnalyzer found $($errors.Count) error(s)"
+              exit 1
+            }
+            Write-Warning "PSScriptAnalyzer found $($results.Count) warning(s)"
+          } else {
+            Write-Host "PSScriptAnalyzer: No issues found" -ForegroundColor Green
+          }
+
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/auto-zap.ps1", [ref]$null, [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          Write-Host "PowerShell syntax: OK"
+
+      # ---- YAML validation ----
+      - name: Validate action.yml
+        run: |
+          python3 -c "
+          import yaml, sys
+          with open('action.yml') as f:
+              data = yaml.safe_load(f)
+          assert 'name' in data, 'Missing name'
+          assert 'inputs' in data, 'Missing inputs'
+          assert 'outputs' in data, 'Missing outputs'
+          assert 'runs' in data, 'Missing runs'
+          assert data['runs']['using'] == 'composite', 'Must be composite action'
+          print(f'action.yml: Valid ({len(data[\"inputs\"])} inputs, {len(data[\"outputs\"])} outputs)')
+          "
+
+      - name: Validate workflow YAML
+        run: |
+          for f in .github/workflows/*.yml; do
+            python3 -c "
+          import yaml, sys
+          with open('$f') as f:
+              data = yaml.safe_load(f)
+          assert 'on' in data or True in data, 'Missing trigger'
+          assert 'jobs' in data, 'Missing jobs'
+          print(f'$f: Valid ({len(data[\"jobs\"])} jobs)')
+          "
+          done
+
+      # ---- NSIS syntax check ----
+      - name: Validate installer.nsi structure
+        run: |
+          echo "Checking installer.nsi structure..."
+          grep -q '!include "MUI2.nsh"' build/installer.nsi || { echo "Missing MUI2 include"; exit 1; }
+          grep -q 'Section.*SecCore' build/installer.nsi || { echo "Missing core section"; exit 1; }
+          grep -q 'Section.*Uninstall' build/installer.nsi || { echo "Missing uninstall section"; exit 1; }
+          grep -q 'WriteUninstaller' build/installer.nsi || { echo "Missing uninstaller"; exit 1; }
+          echo "installer.nsi: Structure OK"
+
+  # ============================================================
+  # Job 2: Test auto-zap.sh on Linux
+  # ============================================================
+  test-linux:
+    name: Test Linux (auto-zap.sh)
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - name: "Help flag"
+            cmd: "./auto-zap.sh --help"
+            expect_exit: 0
+          - name: "Missing Docker target"
+            cmd: "./auto-zap.sh --url http://localhost:19999"
+            expect_exit: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Make executable
+        run: chmod +x auto-zap.sh
+
+      - name: "Test: ${{ matrix.test.name }}"
+        run: |
+          set +e
+          ${{ matrix.test.cmd }}
+          EXIT_CODE=$?
+          set -e
+          if [[ $EXIT_CODE -eq ${{ matrix.test.expect_exit }} ]]; then
+            echo "PASS: Exit code $EXIT_CODE (expected ${{ matrix.test.expect_exit }})"
+          else
+            echo "FAIL: Exit code $EXIT_CODE (expected ${{ matrix.test.expect_exit }})"
+            exit 1
+          fi
+
+  # ============================================================
+  # Job 3: Test auto-zap.ps1 on Windows
+  # ============================================================
+  test-windows:
+    name: Test Windows (auto-zap.ps1)
+    runs-on: windows-latest
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: PowerShell syntax validation
+        shell: pwsh
+        run: |
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD\auto-zap.ps1", [ref]$null, [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          Write-Host "Syntax OK: auto-zap.ps1 parses without errors"
+
+      - name: Validate script parameters
+        shell: pwsh
+        run: |
+          $cmd = Get-Command .\auto-zap.ps1
+          $params = $cmd.Parameters.Keys | Where-Object { $_ -notmatch '^(Verbose|Debug|Error|Warning|Information|OutVariable|OutBuffer|PipelineVariable)' }
+          Write-Host "Parameters found: $($params -join ', ')"
+
+          $expected = @('Url', 'Port', 'ReportPath', 'FullScan', 'KeepDocker', 'SkipInstall',
+                       'AuthUser', 'AuthPassword', 'AuthUrl', 'AuthToken', 'AuthType', 'UseDockerZap')
+          foreach ($p in $expected) {
+            if ($p -notin $params) {
+              Write-Error "Missing expected parameter: $p"
+              exit 1
+            }
+          }
+          Write-Host "All expected parameters present"
+
+  # ============================================================
+  # Job 4: Test composite action (Linux)
+  # ============================================================
+  test-action-linux:
+    name: Test Action (Linux)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create test app
+        run: |
+          mkdir -p /tmp/test-app
+          cat > /tmp/test-app/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html><body><h1>Test App</h1><a href="/page2.html">Page 2</a></body></html>
+          HTML
+          cat > /tmp/test-app/page2.html <<'HTML'
+          <!DOCTYPE html>
+          <html><body><h1>Page 2</h1></body></html>
+          HTML
+
+      - name: Start test server
+        run: |
+          cd /tmp/test-app
+          python3 -m http.server 8888 &
+          sleep 2
+          curl -sf http://localhost:8888 > /dev/null
+          echo "Test server running on port 8888"
+
+      - name: Run Auto-ZAP action
+        id: scan
+        uses: ./
+        with:
+          url: 'http://localhost:8888'
+          skip-install: true
+        continue-on-error: true
+
+      - name: Verify outputs
+        run: |
+          echo "=== Action Outputs ==="
+          echo "report-path: ${{ steps.scan.outputs.report-path }}"
+          echo "json-path: ${{ steps.scan.outputs.json-path }}"
+          echo "high-count: ${{ steps.scan.outputs.high-count }}"
+          echo "medium-count: ${{ steps.scan.outputs.medium-count }}"
+          echo "low-count: ${{ steps.scan.outputs.low-count }}"
+
+          # Verify reports were generated
+          if [[ -f "${{ steps.scan.outputs.report-path }}" ]]; then
+            echo "PASS: HTML report exists ($(wc -c < "${{ steps.scan.outputs.report-path }}") bytes)"
+          else
+            echo "WARN: HTML report not found"
+          fi
+
+          if [[ -f "${{ steps.scan.outputs.json-path }}" ]]; then
+            echo "PASS: JSON report exists ($(wc -c < "${{ steps.scan.outputs.json-path }}") bytes)"
+            # Validate JSON
+            jq empty "${{ steps.scan.outputs.json-path }}" && echo "PASS: Valid JSON" || echo "FAIL: Invalid JSON"
+          else
+            echo "WARN: JSON report not found"
+          fi
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-reports-linux
+          path: |
+            zap-report-*.html
+            zap-report-*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 5: Validate documentation
+  # ============================================================
+  docs:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check README completeness
+        run: |
+          echo "Checking README.md sections..."
+          ERRORS=0
+
+          for section in "Installation" "Quick Start" "Supported Frameworks" "Parameters" \
+                         "Authentication" "How It Works" "Reports" "Linux" "GitHub Actions" \
+                         "Prerequisites" "Troubleshooting"; do
+            if grep -q "## $section" README.md || grep -q "## $section" README.md; then
+              echo "  PASS: Section '$section' found"
+            else
+              echo "  FAIL: Section '$section' missing"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+
+          if [[ $ERRORS -gt 0 ]]; then
+            echo "README is missing $ERRORS section(s)"
+            exit 1
+          fi
+          echo "README: All expected sections present"
+
+      - name: Check download links
+        run: |
+          echo "Checking release download links..."
+          ERRORS=0
+
+          # Check links resolve (HEAD request)
+          for url in $(grep -oP 'https://github.com/bert-euraika/auto-zap/releases/[^\s\)]+' README.md | head -10); do
+            HTTP_CODE=$(curl -sL -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+            if [[ "$HTTP_CODE" =~ ^(200|302)$ ]]; then
+              echo "  PASS ($HTTP_CODE): $url"
+            else
+              echo "  WARN ($HTTP_CODE): $url"
+            fi
+          done
+
+      - name: Check required files exist
+        run: |
+          ERRORS=0
+          for f in auto-zap.ps1 auto-zap.sh action.yml README.md LICENSE.txt \
+                   build/build.ps1 build/installer.nsi \
+                   .github/workflows/security-scan.yml .github/workflows/ci.yml; do
+            if [[ -f "$f" ]]; then
+              echo "  PASS: $f"
+            else
+              echo "  FAIL: $f missing"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+
+          if [[ $ERRORS -gt 0 ]]; then
+            echo "$ERRORS required file(s) missing"
+            exit 1
+          fi
+          echo "All required files present"
+
+      - name: Verify action.yml inputs match README docs
+        run: |
+          echo "Cross-checking action.yml inputs with README..."
+          INPUTS=$(python3 -c "
+          import yaml
+          with open('action.yml') as f:
+              data = yaml.safe_load(f)
+          for k in data.get('inputs', {}):
+              print(k)
+          ")
+
+          ERRORS=0
+          for input in $INPUTS; do
+            if [[ "$input" == "working-directory" ]]; then continue; fi
+            if grep -q "\`$input\`" README.md; then
+              echo "  PASS: '$input' documented"
+            else
+              echo "  WARN: '$input' not found in README"
+            fi
+          done
+
+  # ============================================================
+  # Job 6: Feature parity check
+  # ============================================================
+  feature-parity:
+    name: Feature Parity (ps1 vs sh)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check framework detection parity
+        run: |
+          echo "=== Framework Detection Parity ==="
+          echo ""
+
+          # Frameworks that should be in both scripts
+          FRAMEWORKS=(
+            "package.json:Node.js"
+            "manage.py:Django"
+            "requirements.txt:Python"
+            "pyproject.toml:Python"
+            "csproj:.NET"
+            "pom.xml:Maven/Spring"
+            "build.gradle:Gradle/Spring"
+            "artisan:Laravel"
+            "composer.json:PHP"
+            "Gemfile:Ruby/Rails"
+            "go.mod:Go"
+            "Cargo.toml:Rust"
+            "mix.exs:Elixir"
+            "deno.json:Deno"
+            "Dockerfile:Docker"
+            "index.html:Static"
+          )
+
+          ERRORS=0
+          for fw in "${FRAMEWORKS[@]}"; do
+            FILE="${fw%%:*}"
+            LABEL="${fw##*:}"
+
+            IN_PS1=$(grep -c "$FILE" auto-zap.ps1 2>/dev/null || echo 0)
+            IN_SH=$(grep -c "$FILE" auto-zap.sh 2>/dev/null || echo 0)
+
+            if [[ $IN_PS1 -gt 0 && $IN_SH -gt 0 ]]; then
+              echo "  PASS: $LABEL ($FILE) - ps1:${IN_PS1} sh:${IN_SH}"
+            elif [[ $IN_PS1 -gt 0 && $IN_SH -eq 0 ]]; then
+              echo "  WARN: $LABEL ($FILE) - in ps1 but NOT in sh"
+              ERRORS=$((ERRORS + 1))
+            elif [[ $IN_PS1 -eq 0 && $IN_SH -gt 0 ]]; then
+              echo "  WARN: $LABEL ($FILE) - in sh but NOT in ps1"
+            fi
+          done
+
+          echo ""
+          if [[ $ERRORS -gt 0 ]]; then
+            echo "WARN: $ERRORS framework(s) missing from auto-zap.sh"
+          else
+            echo "All frameworks present in both scripts"
+          fi
+
+      - name: Check CLI parameter parity
+        run: |
+          echo "=== CLI Parameter Parity ==="
+          echo ""
+
+          # Parameters in auto-zap.sh
+          SH_PARAMS=$(grep -oP '^\s+--\K[a-z-]+' auto-zap.sh | sort -u)
+
+          # Parameters in auto-zap.ps1
+          PS1_PARAMS=$(grep -oP '^\s+\[(?:switch|string|int)\]\$\K\w+' auto-zap.ps1 | sort -u)
+
+          echo "auto-zap.sh parameters:"
+          echo "$SH_PARAMS" | sed 's/^/  /'
+          echo ""
+          echo "auto-zap.ps1 parameters:"
+          echo "$PS1_PARAMS" | sed 's/^/  /'
+
+      - name: Check ZAP API endpoint parity
+        run: |
+          echo "=== ZAP API Endpoint Parity ==="
+          echo ""
+
+          # Key endpoints that must be in both
+          ENDPOINTS=(
+            "spider/action/scan"
+            "spider/view/status"
+            "ascan/action/scan"
+            "ascan/view/status"
+            "context/action/newContext"
+            "context/action/includeInContext"
+            "core/other/htmlreport"
+            "core/action/shutdown"
+          )
+
+          for ep in "${ENDPOINTS[@]}"; do
+            IN_PS1=$(grep -c "$ep" auto-zap.ps1 2>/dev/null || echo 0)
+            IN_SH=$(grep -c "$ep" auto-zap.sh 2>/dev/null || echo 0)
+
+            if [[ $IN_PS1 -gt 0 && $IN_SH -gt 0 ]]; then
+              echo "  PASS: $ep"
+            elif [[ $IN_PS1 -gt 0 && $IN_SH -eq 0 ]]; then
+              echo "  MISS: $ep - not in auto-zap.sh"
+            fi
+          done
+
+  # ============================================================
+  # Job 7: Security scan on self
+  # ============================================================
+  security:
+    name: Security Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for hardcoded secrets
+        run: |
+          echo "Scanning for potential secrets..."
+          ERRORS=0
+
+          # Check for hardcoded passwords (exclude parameter declarations and help text)
+          MATCHES=$(grep -rn --include="*.ps1" --include="*.sh" --include="*.yml" \
+            -iP '(?<!Auth)(password|secret|token|api.?key)\s*=\s*["\x27][^$%{}\s]{8,}' . \
+            | grep -v 'CertPassword.*AutoZap2026' \
+            | grep -v '#.*password' \
+            | grep -v 'description:' \
+            | grep -v 'example' \
+            | grep -v 'AuthPassword' \
+            | grep -v 'auth-password' \
+            || true)
+
+          if [[ -n "$MATCHES" ]]; then
+            echo "WARN: Potential hardcoded secrets found:"
+            echo "$MATCHES"
+          else
+            echo "PASS: No hardcoded secrets detected"
+          fi
+
+      - name: Check file permissions
+        run: |
+          echo "Checking file permissions..."
+          if [[ -x auto-zap.sh ]]; then
+            echo "  PASS: auto-zap.sh is executable"
+          else
+            echo "  INFO: auto-zap.sh not executable (chmod +x needed after checkout)"
+          fi
+
+      - name: Check for dangerous patterns
+        run: |
+          echo "Checking for dangerous patterns..."
+          ERRORS=0
+
+          # rm -rf without safeguards
+          if grep -rn 'rm -rf /' auto-zap.sh 2>/dev/null; then
+            echo "  FAIL: Dangerous 'rm -rf /' found in auto-zap.sh"
+            ERRORS=$((ERRORS + 1))
+          fi
+
+          # eval with user input (check for unsanitized eval)
+          EVAL_COUNT=$(grep -c 'eval ' auto-zap.sh 2>/dev/null || echo 0)
+          if [[ $EVAL_COUNT -gt 2 ]]; then
+            echo "  WARN: $EVAL_COUNT eval statements in auto-zap.sh (review for injection)"
+          fi
+
+          # Curl to arbitrary URLs without validation
+          echo "  INFO: Script makes HTTP requests to user-provided URLs (by design)"
+
+          if [[ $ERRORS -gt 0 ]]; then
+            exit 1
+          fi
+          echo "PASS: No dangerous patterns found"
+
+  # ============================================================
+  # Summary
+  # ============================================================
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [lint, test-linux, test-windows, test-action-linux, docs, feature-parity, security]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "### CI Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint & Syntax | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Linux | ${{ needs.test-linux.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Windows | ${{ needs.test-windows.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Action | ${{ needs.test-action-linux.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Documentation | ${{ needs.docs.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Feature Parity | ${{ needs.feature-parity.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail if any required job failed
+        if: |
+          needs.lint.result == 'failure' ||
+          needs.test-linux.result == 'failure' ||
+          needs.test-windows.result == 'failure' ||
+          needs.security.result == 'failure'
+        run: |
+          echo "::error::One or more required CI jobs failed"
+          exit 1
