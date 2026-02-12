@@ -22,10 +22,8 @@ KEEP_DOCKER=false
 SKIP_INSTALL=false
 AUTH_USER=""
 AUTH_PASSWORD=""
-# shellcheck disable=SC2034 # reserved for auth endpoint detection
 AUTH_URL=""
 AUTH_TOKEN=""
-# shellcheck disable=SC2034 # reserved for auth type routing
 AUTH_TYPE=""
 
 # ---- State ----
@@ -54,6 +52,7 @@ log_detail() { echo -e "${GRAY}    $1${NC}"; }
 
 # ---- Parse arguments ----
 while [[ $# -gt 0 ]]; do
+    # shellcheck disable=SC2034
     case $1 in
         --url|-u)           URL="$2"; shift 2 ;;
         --port|-p)          PORT="$2"; shift 2 ;;
