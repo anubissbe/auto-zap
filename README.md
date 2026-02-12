@@ -15,6 +15,7 @@ Drop it into any project, and Auto-ZAP detects your framework, starts your datab
 - **GitHub Action** - Use as `anubissbe/auto-zap@v1` in any workflow
 - **Full pipeline** - Database provisioning, dependency install, migrations, app startup, scan, reports
 - **Authenticated scanning** - Form, JSON, or Bearer token auth with auto-detection
+- **Auto-auth** - Automatically creates temp test users for authenticated scanning (`--auto-auth`)
 - **Multiple reports** - HTML, JSON, and SARIF output formats
 - **CI-ready** - Exit code 1 on HIGH severity findings, artifact-ready reports
 
@@ -47,6 +48,7 @@ chmod +x auto-zap.sh
 ./auto-zap.sh                                    # Auto-detect everything
 ./auto-zap.sh --url http://localhost:3000         # Scan a specific URL
 ./auto-zap.sh --full-scan --auth-token "eyJ..."   # Full scan with auth
+./auto-zap.sh --auto-auth                         # Auto-create temp user + scan
 ```
 
 Requires Docker, curl, and jq.
@@ -57,6 +59,7 @@ Requires Docker, curl, and jq.
 .\auto-zap.ps1                                           # Auto-detect everything
 .\auto-zap.ps1 -Url http://localhost:3000                 # Scan a specific URL
 .\auto-zap.ps1 -FullScan -AuthUser admin -AuthPassword p  # Full scan with auth
+.\auto-zap.ps1 -AutoAuth                                    # Auto-create temp user + scan
 .\auto-zap.ps1 -UseDockerZap                              # Use Docker-based ZAP
 ```
 
@@ -268,6 +271,7 @@ jobs:
 | `auth-url` | No | | Login endpoint URL |
 | `auth-token` | No | | Bearer token |
 | `auth-type` | No | auto | `form`, `json`, or `bearer` |
+| `auto-auth` | No | `false` | Auto-create temp user for authenticated scan |
 | `working-directory` | No | `.` | Working directory |
 
 ### Action Outputs
@@ -315,6 +319,7 @@ Options:
   --auth-url URL         Login endpoint URL
   --auth-token TOKEN     Pre-obtained Bearer token
   --auth-type TYPE       form, json, or bearer
+  --auto-auth, -a        Auto-create temp user for authenticated scanning
   --help, -h             Show help
 ```
 
@@ -388,6 +393,7 @@ cd build
     [-AuthUrl <string>]       # Login endpoint (auto-detected if not provided)
     [-AuthToken <string>]     # Pre-obtained Bearer token
     [-AuthType <string>]      # "form", "json", or "bearer" (auto-detected)
+    [-AutoAuth]               # Auto-create temp user for authenticated scanning
     [-UseDockerZap]           # Force Docker-based ZAP
 ```
 
@@ -399,6 +405,7 @@ cd build
 .\auto-zap.ps1 -FullScan -KeepDocker                          # Full scan, keep containers
 .\auto-zap.ps1 -AuthUser admin -AuthPassword secret123         # Authenticated scan
 .\auto-zap.ps1 -AuthToken "eyJhbGciOiJIUzI1NiIs..."           # Bearer token auth
+.\auto-zap.ps1 -AutoAuth                                       # Auto-detect + create temp user
 .\auto-zap.ps1 -UseDockerZap -ReportPath C:\reports\scan.html  # Docker ZAP, custom report
 ```
 
@@ -433,6 +440,7 @@ Create `.auto-zap.json` in your project root for advanced control:
   "authPassword": "password123",
   "authUrl": "/api/auth/login",
   "authType": "json",
+  "autoAuth": true,
   "exclude": [".*\\/api\\/webhook.*"],
   "migrations": ["npx prisma db push"],
   "preStart": ["npm run build"],
@@ -469,6 +477,7 @@ All fields are optional. CLI parameters override config values. Config values ov
 | `authPassword` | string | Password |
 | `authUrl` | string | Login endpoint URL |
 | `authType` | string | `"form"`, `"json"`, or `"bearer"` |
+| `autoAuth` | boolean | Auto-create temp user for authenticated scanning |
 | `exclude` | string[] | Regex patterns to exclude from scanning |
 | `migrations` | string[] | Migration commands to run before the app |
 | `preStart` | string[] | Commands to run after migrations |
@@ -505,6 +514,41 @@ If you provide credentials without specifying the type, Auto-ZAP will:
 1. Check `.env` files for `ADMIN_USER`, `TEST_USER`, `AUTH_USER` variables
 2. Search for login endpoints at common paths
 3. Determine the auth type from the endpoint response
+
+### Auto-Auth (zero-config authenticated scanning)
+
+```powershell
+.\auto-zap.ps1 -AutoAuth
+```
+```bash
+./auto-zap.sh --auto-auth
+```
+
+When `--auto-auth` / `-AutoAuth` is enabled, Auto-ZAP will:
+
+1. **Detect** whether the app requires authentication (dependency scan + endpoint probing)
+2. **Create** a temporary test user using framework-specific strategies
+3. **Configure** ZAP with the temp credentials for an authenticated scan
+4. **Clean up** the temp user after the scan completes
+
+**Supported frameworks for automatic user creation:**
+
+| Framework | Method | User type |
+|-----------|--------|-----------|
+| **Django** | `manage.py createsuperuser --noinput` | Superuser |
+| **Laravel** | `php artisan tinker` | User model |
+| **WordPress** | `wp user create` (WP-CLI) | Administrator |
+| **Rails/Devise** | `rails runner "User.create!(...)"` | User |
+| **Any (generic)** | POST to `/register`, `/signup`, `/api/auth/register` | Standard user |
+
+For frameworks without a CLI user creation method (Express, FastAPI, NestJS, Spring Boot, Go, etc.), Auto-ZAP probes common registration endpoints with multiple field combinations.
+
+**GitHub Actions:**
+```yaml
+- uses: anubissbe/auto-zap@v1
+  with:
+    auto-auth: true
+```
 
 ---
 

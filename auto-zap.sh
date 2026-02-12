@@ -26,6 +26,7 @@ AUTH_PASSWORD=""
 AUTH_URL=""
 AUTH_TOKEN=""
 AUTH_TYPE=""
+AUTO_AUTH=false
 SARIF=false
 
 # ---- State ----
@@ -42,6 +43,8 @@ MONOREPO_ROOT=""
 INSTALL_DIR=""
 SERVICE_PIDS=()
 CONFIG_FILE=""
+AUTO_AUTH_CREATED=false
+AUTO_AUTH_CLEANUP_CMD=""
 
 # ---- Colors ----
 RED='\033[0;31m'
@@ -73,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --auth-url)         AUTH_URL="$2"; shift 2 ;;
         --auth-token)       AUTH_TOKEN="$2"; shift 2 ;;
         --auth-type)        AUTH_TYPE="$2"; shift 2 ;;
+        --auto-auth|-a)     AUTO_AUTH=true; shift ;;
         --sarif)            SARIF=true; shift ;;
         --help|-h)
             echo "Usage: auto-zap.sh [options]"
@@ -89,6 +93,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --auth-url URL         Login endpoint"
             echo "  --auth-token TOKEN     Pre-obtained Bearer token"
             echo "  --auth-type TYPE       form, json, or bearer"
+            echo "  --auto-auth, -a        Auto-create temp user for authenticated scanning"
             echo "  --sarif                Generate SARIF report for GitHub Code Scanning"
             echo "  --help, -h             Show this help"
             exit 0
@@ -143,6 +148,9 @@ cleanup() {
             docker compose down >/dev/null 2>&1 || docker-compose down >/dev/null 2>&1 || true
         fi
     fi
+
+    # Remove auto-auth temp user if we created one
+    remove_temp_user
 
     log_ok "Cleanup complete."
 }
@@ -210,6 +218,390 @@ urlencode() {
     printf '%s' "$string" | jq -sRr @uri 2>/dev/null \
         || python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))" <<< "$string" 2>/dev/null \
         || printf '%s' "$string"
+}
+
+# ---- Auto-Auth: Generate random string ----
+random_string() {
+    local length="${1:-8}"
+    cat /dev/urandom 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c "$length" 2>/dev/null \
+        || python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range($length)))" 2>/dev/null \
+        || echo "$(date +%s)$$"
+}
+
+# ---- Auto-Auth: Detect if app requires authentication ----
+detect_auth_requirement() {
+    local target_url="$1"
+    local project_dir="$2"
+
+    AUTH_DETECTED=false
+    AUTH_HINT=""
+    AUTH_REG_ENDPOINTS=()
+    AUTH_LOGIN_ENDPOINTS=()
+    AUTH_SUGGESTED_TYPE="json"
+
+    # 1. File-based detection
+    log_detail "Checking dependencies for authentication libraries..."
+
+    # Node.js
+    if [[ -f "$project_dir/package.json" ]]; then
+        local pkg_text
+        pkg_text=$(cat "$project_dir/package.json" 2>/dev/null)
+        for lib in '"passport"' '"bcrypt"' '"bcryptjs"' '"argon2"' '"next-auth"' '"@auth/core"' '"better-auth"' '"lucia"' '"jsonwebtoken"' '"express-session"'; do
+            if echo "$pkg_text" | grep -q "$lib"; then
+                AUTH_DETECTED=true
+                log_detail "Auth library detected: $lib"
+            fi
+        done
+        if echo "$pkg_text" | grep -q '"better-auth"'; then AUTH_HINT="better-auth"; fi
+    fi
+
+    # Python - Django
+    if [[ -f "$project_dir/manage.py" ]]; then
+        local settings_file
+        settings_file=$(find "$project_dir" -name "settings.py" -maxdepth 3 2>/dev/null | head -1)
+        if [[ -n "$settings_file" ]] && grep -q "django.contrib.auth" "$settings_file" 2>/dev/null; then
+            AUTH_DETECTED=true
+            AUTH_HINT="django"
+            log_detail "Django auth detected."
+        fi
+    fi
+
+    # Python - generic
+    for req_file in requirements.txt Pipfile pyproject.toml; do
+        if [[ -f "$project_dir/$req_file" ]]; then
+            for lib in flask-login flask-security fastapi-users passlib bcrypt PyJWT python-jose; do
+                if grep -qi "$lib" "$project_dir/$req_file" 2>/dev/null; then
+                    AUTH_DETECTED=true
+                    log_detail "Auth library detected: $lib"
+                fi
+            done
+        fi
+    done
+
+    # Java Spring Security
+    for build_file in pom.xml build.gradle build.gradle.kts; do
+        if [[ -f "$project_dir/$build_file" ]] && grep -q "spring-boot-starter-security" "$project_dir/$build_file" 2>/dev/null; then
+            AUTH_DETECTED=true
+            AUTH_HINT="spring-boot"
+            log_detail "Spring Security detected."
+        fi
+    done
+
+    # PHP Laravel
+    if [[ -f "$project_dir/composer.json" ]]; then
+        for lib in '"laravel/sanctum"' '"laravel/passport"' '"laravel/breeze"' '"laravel/jetstream"'; do
+            if grep -q "$lib" "$project_dir/composer.json" 2>/dev/null; then
+                AUTH_DETECTED=true
+                AUTH_HINT="laravel"
+                log_detail "Laravel auth detected."
+            fi
+        done
+    fi
+
+    # Ruby Devise
+    if [[ -f "$project_dir/Gemfile" ]] && grep -q "devise" "$project_dir/Gemfile" 2>/dev/null; then
+        AUTH_DETECTED=true
+        AUTH_HINT="rails-devise"
+        log_detail "Rails/Devise detected."
+    fi
+
+    # WordPress
+    if [[ -f "$project_dir/wp-config.php" ]]; then
+        AUTH_DETECTED=true
+        AUTH_HINT="wordpress"
+        AUTH_SUGGESTED_TYPE="form"
+        log_detail "WordPress detected."
+    fi
+
+    # .NET Identity
+    local csproj_file
+    csproj_file=$(find "$project_dir" -name "*.csproj" -maxdepth 2 2>/dev/null | head -1)
+    if [[ -n "$csproj_file" ]] && grep -q "Microsoft.AspNetCore.Identity" "$csproj_file" 2>/dev/null; then
+        AUTH_DETECTED=true
+        AUTH_HINT="aspnet"
+        log_detail "ASP.NET Identity detected."
+    fi
+
+    # .env auth secrets
+    for env_file in .env .env.local .env.development; do
+        if [[ -f "$project_dir/$env_file" ]] && grep -qE "AUTH_SECRET|JWT_SECRET|SESSION_SECRET|NEXTAUTH_SECRET|BETTER_AUTH_SECRET" "$project_dir/$env_file" 2>/dev/null; then
+            AUTH_DETECTED=true
+            log_detail "Auth secret found in $env_file"
+        fi
+    done
+
+    # 2. Runtime probing
+    if [[ -n "$target_url" ]]; then
+        local http_code
+        http_code=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 5 "$target_url" 2>/dev/null || echo "000")
+        if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+            AUTH_DETECTED=true
+            log_detail "App returns HTTP $http_code — auth required."
+        elif [[ "$http_code" == "301" || "$http_code" == "302" || "$http_code" == "307" || "$http_code" == "308" ]]; then
+            local redirect_url
+            redirect_url=$(curl -sf -o /dev/null -w "%{redirect_url}" --max-time 5 "$target_url" 2>/dev/null || echo "")
+            if echo "$redirect_url" | grep -qiE "login|signin|sign-in|auth|accounts"; then
+                AUTH_DETECTED=true
+                log_detail "App redirects to login ($redirect_url) — auth required."
+            fi
+        elif [[ "$http_code" == "200" ]]; then
+            local body
+            body=$(curl -sf --max-time 5 "$target_url" 2>/dev/null || echo "")
+            if echo "$body" | grep -q 'type=.password.'; then
+                AUTH_DETECTED=true
+                log_detail "Main page contains password field — auth required."
+            fi
+        fi
+    fi
+
+    # 3. Probe registration endpoints
+    if [[ "$AUTH_DETECTED" == "true" && -n "$target_url" ]]; then
+        for ep in /api/auth/register /api/auth/signup /api/auth/sign-up /api/auth/sign-up/email /api/register /api/signup /register /signup /api/v1/auth/register /auth/register /auth/signup; do
+            local sc
+            sc=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 3 "${target_url}${ep}" 2>/dev/null || echo "404")
+            if [[ "$sc" != "404" ]]; then
+                AUTH_REG_ENDPOINTS+=("$ep")
+            fi
+        done
+        if [[ ${#AUTH_REG_ENDPOINTS[@]} -gt 0 ]]; then
+            log_detail "Registration endpoints found: ${AUTH_REG_ENDPOINTS[*]}"
+        fi
+
+        # Probe login endpoints
+        for ep in /api/auth/login /api/auth/signin /api/login /auth/login /login /signin /accounts/login/ /wp-login.php /users/sign_in /admin/login/ /Identity/Account/Login /users/log_in; do
+            local sc
+            sc=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 3 "${target_url}${ep}" 2>/dev/null || echo "404")
+            if [[ "$sc" != "404" ]]; then
+                AUTH_LOGIN_ENDPOINTS+=("$ep")
+            fi
+        done
+        if [[ ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]]; then
+            log_detail "Login endpoints found: ${AUTH_LOGIN_ENDPOINTS[*]}"
+        fi
+    fi
+
+    # Adjust auth type based on framework hint
+    if [[ "$AUTH_HINT" == "django" ]]; then
+        for ep in "${AUTH_LOGIN_ENDPOINTS[@]}"; do
+            [[ "$ep" == "/admin/login/" ]] && AUTH_SUGGESTED_TYPE="form"
+        done
+    elif [[ "$AUTH_HINT" == "wordpress" || "$AUTH_HINT" == "rails-devise" ]]; then
+        AUTH_SUGGESTED_TYPE="form"
+    fi
+}
+
+# ---- Auto-Auth: Provision temporary test user ----
+provision_temp_user() {
+    local target_url="$1"
+    local project_dir="$2"
+
+    local rand
+    rand=$(random_string 8)
+    AUTO_AUTH_USER="zapuser-$rand"
+    AUTO_AUTH_EMAIL="zapuser-${rand}@test.local"
+    AUTO_AUTH_PASS="ZapTest-${rand}!1"
+    AUTO_AUTH_CREATED=false
+    AUTO_AUTH_CLEANUP_CMD=""
+    AUTO_AUTH_LOGIN_URL=""
+    AUTO_AUTH_LOGIN_TYPE="$AUTH_SUGGESTED_TYPE"
+
+    log_step "Provisioning temporary test user ($AUTO_AUTH_USER)..."
+
+    # Strategy 1: Framework-specific CLI commands
+
+    # Django
+    if [[ "$AUTH_HINT" == "django" || -f "$project_dir/manage.py" ]]; then
+        log_detail "Attempting Django createsuperuser..."
+        local py_cmd="python3"
+        command -v python3 &>/dev/null || py_cmd="python"
+        if DJANGO_SUPERUSER_USERNAME="$AUTO_AUTH_USER" \
+           DJANGO_SUPERUSER_EMAIL="$AUTO_AUTH_EMAIL" \
+           DJANGO_SUPERUSER_PASSWORD="$AUTO_AUTH_PASS" \
+           $py_cmd "$project_dir/manage.py" createsuperuser --noinput 2>&1; then
+            log_ok "Django superuser created: $AUTO_AUTH_USER"
+            AUTO_AUTH_CREATED=true
+            AUTO_AUTH_CLEANUP_CMD="django:$project_dir:$AUTO_AUTH_USER:$py_cmd"
+            # Find best login URL
+            for ep in "${AUTH_LOGIN_ENDPOINTS[@]}"; do
+                [[ "$ep" == "/admin/login/" ]] && AUTO_AUTH_LOGIN_URL="${target_url}/admin/login/" && AUTO_AUTH_LOGIN_TYPE="form" && break
+            done
+            [[ -z "$AUTO_AUTH_LOGIN_URL" && ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
+        fi
+        [[ "$AUTO_AUTH_CREATED" == "true" ]] && return 0
+    fi
+
+    # Laravel
+    if [[ "$AUTH_HINT" == "laravel" || -f "$project_dir/artisan" ]]; then
+        log_detail "Attempting Laravel user creation via artisan tinker..."
+        local tinker_code="\\App\\Models\\User::create(['name'=>'$AUTO_AUTH_USER','email'=>'$AUTO_AUTH_EMAIL','password'=>bcrypt('$AUTO_AUTH_PASS')]); echo 'OK';"
+        local output
+        output=$(php "$project_dir/artisan" tinker --execute="$tinker_code" 2>&1) || true
+        if echo "$output" | grep -q "OK"; then
+            log_ok "Laravel user created: $AUTO_AUTH_USER"
+            AUTO_AUTH_CREATED=true
+            AUTO_AUTH_USER="$AUTO_AUTH_EMAIL"  # Laravel uses email for login
+            AUTO_AUTH_CLEANUP_CMD="laravel:$project_dir:$AUTO_AUTH_EMAIL"
+            [[ ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
+        fi
+        [[ "$AUTO_AUTH_CREATED" == "true" ]] && return 0
+    fi
+
+    # WordPress
+    if [[ "$AUTH_HINT" == "wordpress" || -f "$project_dir/wp-config.php" ]]; then
+        log_detail "Attempting WordPress user creation via WP-CLI..."
+        if wp user create "$AUTO_AUTH_USER" "$AUTO_AUTH_EMAIL" --user_pass="$AUTO_AUTH_PASS" --role=administrator --path="$project_dir" 2>&1; then
+            log_ok "WordPress user created: $AUTO_AUTH_USER"
+            AUTO_AUTH_CREATED=true
+            AUTO_AUTH_CLEANUP_CMD="wordpress:$project_dir:$AUTO_AUTH_USER"
+            AUTO_AUTH_LOGIN_URL="${target_url}/wp-login.php"
+            AUTO_AUTH_LOGIN_TYPE="form"
+        fi
+        [[ "$AUTO_AUTH_CREATED" == "true" ]] && return 0
+    fi
+
+    # Rails/Devise
+    if [[ "$AUTH_HINT" == "rails-devise" ]]; then
+        log_detail "Attempting Rails/Devise user creation..."
+        local ruby_code="User.create!(email: '$AUTO_AUTH_EMAIL', password: '$AUTO_AUTH_PASS', password_confirmation: '$AUTO_AUTH_PASS')"
+        if (cd "$project_dir" && bundle exec rails runner "$ruby_code" 2>&1); then
+            log_ok "Rails/Devise user created: $AUTO_AUTH_EMAIL"
+            AUTO_AUTH_CREATED=true
+            AUTO_AUTH_USER="$AUTO_AUTH_EMAIL"
+            AUTO_AUTH_CLEANUP_CMD="rails:$project_dir:$AUTO_AUTH_EMAIL"
+            for ep in "${AUTH_LOGIN_ENDPOINTS[@]}"; do
+                [[ "$ep" == "/users/sign_in" ]] && AUTO_AUTH_LOGIN_URL="${target_url}/users/sign_in" && AUTO_AUTH_LOGIN_TYPE="form" && break
+            done
+            [[ -z "$AUTO_AUTH_LOGIN_URL" && ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
+        fi
+        [[ "$AUTO_AUTH_CREATED" == "true" ]] && return 0
+    fi
+
+    # Strategy 2: Registration endpoint probing
+    if [[ ${#AUTH_REG_ENDPOINTS[@]} -gt 0 ]]; then
+        log_detail "Attempting user registration via API endpoints..."
+        for ep in "${AUTH_REG_ENDPOINTS[@]}"; do
+            local reg_url="${target_url}${ep}"
+
+            # Try JSON registrations with different field combinations
+            for json_body in \
+                "{\"username\":\"$AUTO_AUTH_USER\",\"email\":\"$AUTO_AUTH_EMAIL\",\"password\":\"$AUTO_AUTH_PASS\"}" \
+                "{\"email\":\"$AUTO_AUTH_EMAIL\",\"password\":\"$AUTO_AUTH_PASS\",\"name\":\"$AUTO_AUTH_USER\"}" \
+                "{\"email\":\"$AUTO_AUTH_EMAIL\",\"password\":\"$AUTO_AUTH_PASS\",\"password_confirmation\":\"$AUTO_AUTH_PASS\"}" \
+                "{\"username\":\"$AUTO_AUTH_USER\",\"email\":\"$AUTO_AUTH_EMAIL\",\"password\":\"$AUTO_AUTH_PASS\",\"confirmPassword\":\"$AUTO_AUTH_PASS\"}"; do
+
+                local http_code
+                local response
+                response=$(curl -sf -w "\n%{http_code}" --max-time 10 -X POST \
+                    -H "Content-Type: application/json" \
+                    -d "$json_body" \
+                    "$reg_url" 2>/dev/null) || true
+                http_code=$(echo "$response" | tail -1)
+                local body
+                body=$(echo "$response" | sed '$d')
+
+                if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+                    # Determine which field was the login identifier
+                    if echo "$json_body" | jq -e '.username' &>/dev/null && echo "$json_body" | jq -e '.email' &>/dev/null; then
+                        # Has both — prefer email if email field was primary
+                        if echo "$json_body" | grep -q '"email".*"password"'; then
+                            AUTO_AUTH_USER="$AUTO_AUTH_EMAIL"
+                        fi
+                    elif echo "$json_body" | jq -e '.email' &>/dev/null; then
+                        AUTO_AUTH_USER="$AUTO_AUTH_EMAIL"
+                    fi
+
+                    log_ok "User registered via $ep (HTTP $http_code)"
+                    AUTO_AUTH_CREATED=true
+                    AUTO_AUTH_LOGIN_TYPE="json"
+                    AUTO_AUTH_CLEANUP_CMD="api:$target_url:$AUTO_AUTH_USER"
+
+                    # Try to extract token for later cleanup
+                    local token
+                    token=$(echo "$body" | jq -r '.token // .access_token // .accessToken // empty' 2>/dev/null || echo "")
+                    [[ -n "$token" ]] && AUTO_AUTH_CLEANUP_CMD="api:$target_url:$AUTO_AUTH_USER:$token"
+
+                    [[ ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
+                    return 0
+                fi
+            done
+
+            # Try form-based registration
+            local form_body="username=$(urlencode "$AUTO_AUTH_USER")&email=$(urlencode "$AUTO_AUTH_EMAIL")&password=$(urlencode "$AUTO_AUTH_PASS")"
+            local http_code
+            http_code=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 -X POST \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                -d "$form_body" \
+                "$reg_url" 2>/dev/null) || true
+            if [[ "$http_code" =~ ^[23][0-9][0-9]$ ]]; then
+                log_ok "User registered via $ep (form, HTTP $http_code)"
+                AUTO_AUTH_CREATED=true
+                AUTO_AUTH_USER="$AUTO_AUTH_EMAIL"
+                AUTO_AUTH_LOGIN_TYPE="form"
+                AUTO_AUTH_CLEANUP_CMD="api:$target_url:$AUTO_AUTH_EMAIL"
+                [[ ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
+                return 0
+            fi
+        done
+    fi
+
+    log_warn "Could not provision a temporary user automatically."
+    log_warn "Tip: Use --auth-user/--auth-password to provide existing credentials."
+    return 1
+}
+
+# ---- Auto-Auth: Remove temporary test user ----
+remove_temp_user() {
+    if [[ "$AUTO_AUTH_CREATED" != "true" || -z "$AUTO_AUTH_CLEANUP_CMD" ]]; then return; fi
+
+    log_step "Removing temporary test user..."
+
+    local method project_dir identifier extra
+    IFS=':' read -r method project_dir identifier extra <<< "$AUTO_AUTH_CLEANUP_CMD"
+
+    case "$method" in
+        django)
+            local py_cmd="$extra"
+            [[ -z "$py_cmd" ]] && py_cmd="python3"
+            local del_code="from django.contrib.auth.models import User; User.objects.filter(username='$identifier').delete(); print('deleted')"
+            local output
+            output=$($py_cmd "$project_dir/manage.py" shell -c "$del_code" 2>&1) || true
+            if echo "$output" | grep -q "deleted"; then
+                log_ok "Django temp user removed."
+            else
+                log_warn "Django user cleanup may have failed."
+            fi
+            ;;
+        laravel)
+            local del_code="\\App\\Models\\User::where('email','$identifier')->delete(); echo 'deleted';"
+            local output
+            output=$(php "$project_dir/artisan" tinker --execute="$del_code" 2>&1) || true
+            if echo "$output" | grep -q "deleted"; then
+                log_ok "Laravel temp user removed."
+            else
+                log_warn "Laravel user cleanup may have failed."
+            fi
+            ;;
+        wordpress)
+            wp user delete "$identifier" --yes --path="$project_dir" 2>&1 || log_warn "WordPress user cleanup may have failed."
+            log_ok "WordPress temp user removed."
+            ;;
+        rails)
+            (cd "$project_dir" && bundle exec rails runner "User.find_by(email: '$identifier')&.destroy!" 2>&1) || log_warn "Rails user cleanup may have failed."
+            log_ok "Rails temp user removed."
+            ;;
+        api)
+            local token="$extra"
+            if [[ -n "$token" ]]; then
+                for ep in /api/auth/user /api/user /api/users/me /api/auth/account; do
+                    if curl -sf -X DELETE -H "Authorization: Bearer $token" --max-time 5 "${project_dir}${ep}" >/dev/null 2>&1; then
+                        log_ok "API temp user removed via DELETE $ep"
+                        return
+                    fi
+                done
+            fi
+            log_warn "Could not remove API-created temp user automatically."
+            ;;
+    esac
 }
 
 # ---- Helper: Load .env file ----
@@ -995,7 +1387,31 @@ fi
 echo ""
 
 # ============================================================
-# STEP 9: Authentication (if provided)
+# STEP 9a: Auto-Auth (detect, provision temp user)
+# ============================================================
+if [[ "$AUTO_AUTH" == "true" && -z "$AUTH_USER" && -z "$AUTH_TOKEN" ]]; then
+    log_step "STEP 9a: Auto-auth — detecting authentication requirements..."
+    detect_auth_requirement "$URL" "$ORIGINAL_DIR"
+
+    if [[ "$AUTH_DETECTED" == "true" ]]; then
+        log_ok "Authentication required — attempting to provision temp user..."
+        if provision_temp_user "$URL" "$ORIGINAL_DIR"; then
+            AUTH_USER="$AUTO_AUTH_USER"
+            AUTH_PASSWORD="$AUTO_AUTH_PASS"
+            AUTH_TYPE="$AUTO_AUTH_LOGIN_TYPE"
+            [[ -n "$AUTO_AUTH_LOGIN_URL" ]] && AUTH_URL="$AUTO_AUTH_LOGIN_URL"
+            log_ok "Auto-auth: temp user ready ($AUTH_USER) — proceeding with authenticated scan."
+        else
+            log_warn "Auto-auth: could not create temp user. Falling back to unauthenticated scan."
+        fi
+    else
+        log_ok "Auto-auth: app does not appear to require authentication. Scanning unauthenticated."
+    fi
+    echo ""
+fi
+
+# ============================================================
+# STEP 9b: Authentication (ZAP configuration)
 # ============================================================
 ZAP_USER_ID=""
 

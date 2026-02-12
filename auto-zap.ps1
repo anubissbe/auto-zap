@@ -39,6 +39,12 @@
     Pre-obtained Bearer token (skip login flow)
 .PARAMETER AuthType
     Authentication type: "form", "json", or "bearer" (auto-detected if not provided)
+.PARAMETER AutoAuth
+    Automatically detect authentication requirements, create a temporary test user,
+    and configure ZAP for authenticated scanning. Supports Django (createsuperuser),
+    Laravel (artisan tinker), WordPress (wp-cli), Rails (runner), Spring Boot
+    (application.properties), and generic web apps (registration endpoint probing).
+    The temporary user is removed after the scan completes.
 .PARAMETER UseDockerZap
     Force using Docker-based ZAP even if local install exists
 .PARAMETER ScanMode
@@ -56,6 +62,7 @@
     .\auto-zap.ps1 -UseDockerZap
     .\auto-zap.ps1 -ScanMode api
     .\auto-zap.ps1 -DryRun
+    .\auto-zap.ps1 -AutoAuth
     .\auto-zap.ps1 -ScanMode static -VerboseLog
 #>
 param(
@@ -71,6 +78,7 @@ param(
     [string]$AuthToken,
     [ValidateSet("form", "json", "bearer", "")]
     [string]$AuthType,
+    [switch]$AutoAuth,
     [switch]$UseDockerZap,
     [ValidateSet("auto", "webapp", "api", "static", "")]
     [string]$ScanMode = "auto",
@@ -594,6 +602,11 @@ function Cleanup {
     if ((Test-Command "docker") -and $script:RedisContainerStartedByUs -and -not $KeepDocker) {
         Write-Detail "Stopping Redis container..."
         docker stop $script:RedisContainerName 2>$null | Out-Null
+    }
+
+    # Remove auto-auth temp user if we created one
+    if ($script:AutoAuthProvisioned -and $script:AutoAuthCleanupInfo) {
+        Remove-TempUser -CleanupInfo $script:AutoAuthCleanupInfo -ProjectDir $script:OriginalDir
     }
 
     Write-Ok "Cleanup complete."
@@ -2854,7 +2867,647 @@ function Import-GraphqlSchema {
 }
 
 # =============================================================
-# PHASE 3: Authenticated Scanning
+# PHASE 3a: Auto-Auth - Detection, Provisioning & Cleanup
+# =============================================================
+
+# State for auto-auth cleanup
+$script:AutoAuthProvisioned = $false
+$script:AutoAuthCleanupInfo = $null
+
+function Detect-AuthRequirement {
+    <#
+    .SYNOPSIS
+        Detects whether the target application requires authentication by
+        inspecting dependency files and probing the running application.
+    .OUTPUTS
+        Hashtable with: Required (bool), Libraries (array), AuthType (string),
+        RegistrationEndpoints (array), LoginEndpoints (array), Framework (string)
+    #>
+    param(
+        [string]$TargetUrl,
+        [string]$ProjectDir,
+        [hashtable]$Framework
+    )
+
+    $result = @{
+        Required              = $false
+        Libraries             = @()
+        SuggestedAuthType     = "json"
+        RegistrationEndpoints = @()
+        LoginEndpoints        = @()
+        FrameworkAuthHint     = $null
+    }
+
+    $runtime = if ($Framework) { $Framework.Runtime } else { "" }
+
+    # --- 1. File-based detection: check for auth libraries in dependencies ---
+    Write-Detail "Checking dependencies for authentication libraries..."
+
+    # Node.js
+    $pkgPath = Join-Path $ProjectDir "package.json"
+    if (Test-Path $pkgPath) {
+        $pkgText = Get-Content $pkgPath -Raw -ErrorAction SilentlyContinue
+        if ($pkgText) {
+            $nodeAuthLibs = @(
+                @{ Pattern = '"passport"';             Name = "passport" },
+                @{ Pattern = '"bcrypt"';               Name = "bcrypt" },
+                @{ Pattern = '"bcryptjs"';             Name = "bcryptjs" },
+                @{ Pattern = '"argon2"';               Name = "argon2" },
+                @{ Pattern = '"next-auth"';            Name = "next-auth" },
+                @{ Pattern = '"@auth/core"';           Name = "auth.js" },
+                @{ Pattern = '"better-auth"';          Name = "better-auth" },
+                @{ Pattern = '"lucia"';                Name = "lucia" },
+                @{ Pattern = '"@clerk/nextjs"';        Name = "clerk" },
+                @{ Pattern = '"@clerk/express"';       Name = "clerk" },
+                @{ Pattern = '"auth0"';                Name = "auth0" },
+                @{ Pattern = '"jsonwebtoken"';         Name = "jsonwebtoken" },
+                @{ Pattern = '"express-session"';      Name = "express-session" },
+                @{ Pattern = '"@supabase/supabase-js"'; Name = "supabase" },
+                @{ Pattern = '"firebase-admin"';       Name = "firebase" }
+            )
+            foreach ($lib in $nodeAuthLibs) {
+                if ($pkgText -match [regex]::Escape($lib.Pattern)) {
+                    $result.Libraries += $lib.Name
+                }
+            }
+            # Better Auth has a known registration endpoint
+            if ($pkgText -match '"better-auth"') {
+                $result.FrameworkAuthHint = "better-auth"
+            }
+        }
+    }
+
+    # Python
+    foreach ($reqFile in @("requirements.txt", "Pipfile", "pyproject.toml")) {
+        $reqPath = Join-Path $ProjectDir $reqFile
+        if (Test-Path $reqPath) {
+            $reqText = Get-Content $reqPath -Raw -ErrorAction SilentlyContinue
+            if ($reqText) {
+                $pyAuthLibs = @(
+                    @{ Pattern = "django.contrib.auth"; Name = "django-auth" },
+                    @{ Pattern = "django-allauth";      Name = "django-allauth" },
+                    @{ Pattern = "djangorestframework";  Name = "drf" },
+                    @{ Pattern = "flask-login";          Name = "flask-login" },
+                    @{ Pattern = "flask-security";       Name = "flask-security" },
+                    @{ Pattern = "fastapi-users";        Name = "fastapi-users" },
+                    @{ Pattern = "python-jose";          Name = "python-jose" },
+                    @{ Pattern = "PyJWT";                Name = "pyjwt" },
+                    @{ Pattern = "passlib";              Name = "passlib" },
+                    @{ Pattern = "bcrypt";               Name = "bcrypt" }
+                )
+                foreach ($lib in $pyAuthLibs) {
+                    if ($reqText -match [regex]::Escape($lib.Pattern)) {
+                        $result.Libraries += $lib.Name
+                    }
+                }
+            }
+        }
+    }
+    # Django settings.py
+    $settingsPath = Get-ChildItem -Path $ProjectDir -Recurse -Filter "settings.py" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($settingsPath) {
+        $settingsText = Get-Content $settingsPath.FullName -Raw -ErrorAction SilentlyContinue
+        if ($settingsText -and $settingsText -match "django\.contrib\.auth") {
+            $result.Libraries += "django-auth"
+            $result.FrameworkAuthHint = "django"
+        }
+    }
+
+    # Java (Spring Boot)
+    foreach ($buildFile in @("pom.xml", "build.gradle", "build.gradle.kts")) {
+        $buildPath = Join-Path $ProjectDir $buildFile
+        if (Test-Path $buildPath) {
+            $buildText = Get-Content $buildPath -Raw -ErrorAction SilentlyContinue
+            if ($buildText -and $buildText -match "spring-boot-starter-security") {
+                $result.Libraries += "spring-security"
+                $result.FrameworkAuthHint = "spring-boot"
+            }
+        }
+    }
+
+    # PHP (Laravel)
+    $composerPath = Join-Path $ProjectDir "composer.json"
+    if (Test-Path $composerPath) {
+        $composerText = Get-Content $composerPath -Raw -ErrorAction SilentlyContinue
+        if ($composerText) {
+            if ($composerText -match '"laravel/sanctum"' -or $composerText -match '"laravel/passport"' -or $composerText -match '"laravel/breeze"' -or $composerText -match '"laravel/jetstream"') {
+                $result.Libraries += "laravel-auth"
+                $result.FrameworkAuthHint = "laravel"
+            }
+        }
+    }
+
+    # Ruby (Rails / Devise)
+    $gemfilePath = Join-Path $ProjectDir "Gemfile"
+    if (Test-Path $gemfilePath) {
+        $gemText = Get-Content $gemfilePath -Raw -ErrorAction SilentlyContinue
+        if ($gemText -and $gemText -match "devise") {
+            $result.Libraries += "devise"
+            $result.FrameworkAuthHint = "rails-devise"
+        }
+    }
+
+    # .NET (ASP.NET Identity)
+    $csprojFiles = Get-ChildItem -Path $ProjectDir -Filter "*.csproj" -ErrorAction SilentlyContinue
+    foreach ($csproj in $csprojFiles) {
+        $csprojText = Get-Content $csproj.FullName -Raw -ErrorAction SilentlyContinue
+        if ($csprojText -and $csprojText -match "Microsoft\.AspNetCore\.Identity") {
+            $result.Libraries += "aspnet-identity"
+            $result.FrameworkAuthHint = "aspnet"
+        }
+    }
+
+    # WordPress
+    if (Test-Path (Join-Path $ProjectDir "wp-config.php")) {
+        $result.Libraries += "wordpress"
+        $result.FrameworkAuthHint = "wordpress"
+    }
+
+    # Generic auth file indicators
+    foreach ($authFile in @("auth.ts", "auth.js", "auth.config.ts", "auth.config.js", "middleware.ts")) {
+        if (Test-Path (Join-Path $ProjectDir $authFile)) {
+            $result.Libraries += "auth-file:$authFile"
+        }
+    }
+
+    # Check .env for auth secrets
+    foreach ($envFile in @(".env", ".env.local", ".env.development")) {
+        $envPath = Join-Path $ProjectDir $envFile
+        if (Test-Path $envPath) {
+            $envText = Get-Content $envPath -Raw -ErrorAction SilentlyContinue
+            if ($envText -and ($envText -match "AUTH_SECRET|JWT_SECRET|SESSION_SECRET|NEXTAUTH_SECRET|BETTER_AUTH_SECRET")) {
+                $result.Libraries += "env-auth-secret"
+            }
+        }
+    }
+
+    if ($result.Libraries.Count -gt 0) {
+        $result.Required = $true
+        Write-Detail "Auth libraries detected: $($result.Libraries -join ', ')"
+    }
+
+    # --- 2. Runtime probing: check if app redirects to login ---
+    if ($TargetUrl) {
+        try {
+            $resp = Invoke-WebRequest -Uri $TargetUrl -UseBasicParsing -TimeoutSec 5 -MaximumRedirection 0 -ErrorAction Stop
+            # 200 with login form in HTML
+            if ($resp.Content -match 'type=.password.') {
+                $result.Required = $true
+                Write-Detail "Main page contains password field - auth required."
+            }
+        } catch {
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                if ($statusCode -eq 401 -or $statusCode -eq 403) {
+                    $result.Required = $true
+                    Write-Detail "App returns HTTP $statusCode - auth required."
+                }
+                elseif ($statusCode -eq 301 -or $statusCode -eq 302 -or $statusCode -eq 307 -or $statusCode -eq 308) {
+                    $location = "$($_.Exception.Response.Headers.Location)"
+                    if ($location -match "(?:login|signin|sign-in|auth|accounts)") {
+                        $result.Required = $true
+                        Write-Detail "App redirects to login - auth required."
+                    }
+                }
+            }
+        }
+    }
+
+    # --- 3. Probe registration endpoints (for user creation) ---
+    if ($TargetUrl -and $result.Required) {
+        $regEndpoints = @(
+            "/api/auth/register", "/api/auth/signup", "/api/auth/sign-up",
+            "/api/auth/sign-up/email",
+            "/api/register", "/api/signup",
+            "/register", "/signup",
+            "/api/v1/auth/register",
+            "/auth/register", "/auth/signup",
+            "/api/users"
+        )
+        foreach ($ep in $regEndpoints) {
+            try {
+                $testUrl = "${TargetUrl}${ep}"
+                $resp = Invoke-WebRequest -Uri $testUrl -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+                $result.RegistrationEndpoints += $ep
+            } catch {
+                if ($_.Exception.Response) {
+                    $sc = [int]$_.Exception.Response.StatusCode
+                    # 405 = endpoint exists but needs POST; 400 = expects body; 422 = validation error
+                    if ($sc -eq 405 -or $sc -eq 400 -or $sc -eq 422) {
+                        $result.RegistrationEndpoints += $ep
+                    }
+                }
+            }
+        }
+
+        # Probe login endpoints
+        $loginEndpoints = @(
+            "/api/auth/login", "/api/auth/signin", "/api/auth/sign-in",
+            "/api/login", "/auth/login", "/auth/signin",
+            "/login", "/signin", "/accounts/login/",
+            "/wp-login.php", "/users/sign_in", "/admin/login/",
+            "/Identity/Account/Login", "/users/log_in",
+            "/api/auth/callback/credentials"
+        )
+        foreach ($ep in $loginEndpoints) {
+            try {
+                $testUrl = "${TargetUrl}${ep}"
+                $resp = Invoke-WebRequest -Uri $testUrl -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+                $result.LoginEndpoints += $ep
+            } catch {
+                if ($_.Exception.Response) {
+                    $sc = [int]$_.Exception.Response.StatusCode
+                    if ($sc -ne 404) {
+                        $result.LoginEndpoints += $ep
+                    }
+                }
+            }
+        }
+
+        if ($result.RegistrationEndpoints.Count -gt 0) {
+            Write-Detail "Registration endpoints found: $($result.RegistrationEndpoints -join ', ')"
+        }
+        if ($result.LoginEndpoints.Count -gt 0) {
+            Write-Detail "Login endpoints found: $($result.LoginEndpoints -join ', ')"
+        }
+    }
+
+    # Determine suggested auth type based on framework
+    if ($result.FrameworkAuthHint -eq "django" -and $result.LoginEndpoints -contains "/admin/login/") {
+        $result.SuggestedAuthType = "form"
+    }
+    elseif ($result.FrameworkAuthHint -eq "wordpress") {
+        $result.SuggestedAuthType = "form"
+    }
+    elseif ($result.FrameworkAuthHint -eq "rails-devise") {
+        $result.SuggestedAuthType = "form"
+    }
+
+    return $result
+}
+
+function Provision-TempUser {
+    <#
+    .SYNOPSIS
+        Creates a temporary test user for authenticated scanning.
+        Uses framework-specific strategies in priority order:
+        1. Framework CLI commands (Django createsuperuser, Laravel tinker, WP CLI, Rails runner)
+        2. Registration endpoint probing (POST to /register, /signup, etc.)
+        3. Spring Boot property injection (already handled at app start)
+    .OUTPUTS
+        Hashtable with: Success (bool), User, Password, LoginUrl, AuthType, CleanupInfo
+    #>
+    param(
+        [string]$TargetUrl,
+        [string]$ProjectDir,
+        [hashtable]$Framework,
+        [hashtable]$AuthDetection
+    )
+
+    # Generate secure random credentials
+    $randomSuffix = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 8 | ForEach-Object { [char]$_ })
+    $tempUser     = "zapuser-$randomSuffix"
+    $tempEmail    = "zapuser-${randomSuffix}@test.local"
+    $tempPass     = "ZapTest-${randomSuffix}!1"
+
+    $result = @{
+        Success     = $false
+        User        = $tempUser
+        Email       = $tempEmail
+        Password    = $tempPass
+        LoginUrl    = $null
+        AuthType    = $AuthDetection.SuggestedAuthType
+        CleanupInfo = @{ Method = "none" }
+    }
+
+    $runtime = if ($Framework) { $Framework.Runtime } else { "" }
+    $hint    = $AuthDetection.FrameworkAuthHint
+
+    Write-Step "Provisioning temporary test user ($tempUser)..."
+
+    # ---- Strategy 1: Framework-specific CLI commands ----
+
+    # Django: createsuperuser --noinput
+    if ($hint -eq "django" -or (Test-Path (Join-Path $ProjectDir "manage.py"))) {
+        Write-Detail "Attempting Django createsuperuser..."
+        $managePy = Join-Path $ProjectDir "manage.py"
+        $env:DJANGO_SUPERUSER_USERNAME = $tempUser
+        $env:DJANGO_SUPERUSER_EMAIL    = $tempEmail
+        $env:DJANGO_SUPERUSER_PASSWORD = $tempPass
+        try {
+            $pyCmd = if (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } else { "python" }
+            $output = & $pyCmd $managePy createsuperuser --noinput 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "Django superuser created: $tempUser"
+                $result.Success = $true
+                $result.CleanupInfo = @{
+                    Method     = "django"
+                    ProjectDir = $ProjectDir
+                    Username   = $tempUser
+                    PyCmd      = $pyCmd
+                }
+                # Django admin login
+                if ($AuthDetection.LoginEndpoints -contains "/admin/login/") {
+                    $result.LoginUrl = "${TargetUrl}/admin/login/"
+                    $result.AuthType = "form"
+                } elseif ($AuthDetection.LoginEndpoints.Count -gt 0) {
+                    $result.LoginUrl = "${TargetUrl}$($AuthDetection.LoginEndpoints[0])"
+                }
+            } else {
+                Write-Detail "Django createsuperuser failed: $output"
+            }
+        } catch {
+            Write-Detail "Django createsuperuser error: $($_.Exception.Message)"
+        } finally {
+            Remove-Item Env:\DJANGO_SUPERUSER_USERNAME -ErrorAction SilentlyContinue
+            Remove-Item Env:\DJANGO_SUPERUSER_EMAIL -ErrorAction SilentlyContinue
+            Remove-Item Env:\DJANGO_SUPERUSER_PASSWORD -ErrorAction SilentlyContinue
+        }
+        if ($result.Success) { return $result }
+    }
+
+    # Laravel: php artisan tinker
+    if ($hint -eq "laravel" -or (Test-Path (Join-Path $ProjectDir "artisan"))) {
+        Write-Detail "Attempting Laravel user creation via artisan tinker..."
+        $artisan = Join-Path $ProjectDir "artisan"
+        $tinkerCode = '\App\Models\User::create([''name''=>''__USER__'',''email''=>''__EMAIL__'',''password''=>bcrypt(''__PASS__'')]); echo ''OK'';'
+        $tinkerCode = $tinkerCode.Replace('__USER__', $tempUser).Replace('__EMAIL__', $tempEmail).Replace('__PASS__', $tempPass)
+        try {
+            $executeArg = "--execute=$tinkerCode"
+            $output = & php $artisan tinker $executeArg 2>&1
+            if ($output -match "OK") {
+                Write-Ok "Laravel user created: $tempUser"
+                $result.Success = $true
+                $result.User = $tempEmail  # Laravel typically uses email for login
+                $result.CleanupInfo = @{
+                    Method     = "laravel"
+                    ProjectDir = $ProjectDir
+                    Email      = $tempEmail
+                }
+                if ($AuthDetection.LoginEndpoints.Count -gt 0) {
+                    $result.LoginUrl = "${TargetUrl}$($AuthDetection.LoginEndpoints[0])"
+                }
+            } else {
+                Write-Detail "Laravel tinker output: $output"
+            }
+        } catch {
+            Write-Detail "Laravel tinker error: $($_.Exception.Message)"
+        }
+        if ($result.Success) { return $result }
+    }
+
+    # WordPress: wp user create
+    if ($hint -eq "wordpress" -or (Test-Path (Join-Path $ProjectDir "wp-config.php"))) {
+        Write-Detail "Attempting WordPress user creation via WP-CLI..."
+        try {
+            $output = & wp user create $tempUser $tempEmail --user_pass="$tempPass" --role=administrator --path="$ProjectDir" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "WordPress user created: $tempUser"
+                $result.Success = $true
+                $result.CleanupInfo = @{
+                    Method     = "wordpress"
+                    ProjectDir = $ProjectDir
+                    Username   = $tempUser
+                }
+                $result.LoginUrl = "${TargetUrl}/wp-login.php"
+                $result.AuthType = "form"
+            } else {
+                Write-Detail "WP-CLI output: $output"
+            }
+        } catch {
+            Write-Detail "WP-CLI error: $($_.Exception.Message)"
+        }
+        if ($result.Success) { return $result }
+    }
+
+    # Rails: rails runner
+    if ($hint -eq "rails-devise" -or (Test-Path (Join-Path $ProjectDir "Gemfile"))) {
+        $gemText = Get-Content (Join-Path $ProjectDir "Gemfile") -Raw -ErrorAction SilentlyContinue
+        if ($gemText -and $gemText -match "devise") {
+            Write-Detail "Attempting Rails/Devise user creation..."
+            $rubyCode = "User.create!(email: '$tempEmail', password: '$tempPass', password_confirmation: '$tempPass')"
+            try {
+                Push-Location $ProjectDir
+                $output = & bundle exec rails runner "$rubyCode" 2>&1
+                Pop-Location
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Ok "Rails/Devise user created: $tempEmail"
+                    $result.Success = $true
+                    $result.User = $tempEmail
+                    $result.CleanupInfo = @{
+                        Method     = "rails"
+                        ProjectDir = $ProjectDir
+                        Email      = $tempEmail
+                    }
+                    if ($AuthDetection.LoginEndpoints -contains "/users/sign_in") {
+                        $result.LoginUrl = "${TargetUrl}/users/sign_in"
+                        $result.AuthType = "form"
+                    } elseif ($AuthDetection.LoginEndpoints.Count -gt 0) {
+                        $result.LoginUrl = "${TargetUrl}$($AuthDetection.LoginEndpoints[0])"
+                    }
+                } else {
+                    Write-Detail "Rails runner output: $output"
+                }
+            } catch {
+                Write-Detail "Rails runner error: $($_.Exception.Message)"
+                Pop-Location -ErrorAction SilentlyContinue
+            }
+            if ($result.Success) { return $result }
+        }
+    }
+
+    # ---- Strategy 2: Registration endpoint probing (works for any framework) ----
+    if ($AuthDetection.RegistrationEndpoints.Count -gt 0) {
+        Write-Detail "Attempting user registration via API endpoints..."
+
+        # Try JSON registration first, then form-based
+        $jsonBodies = @(
+            @{ body = @{ username = $tempUser; email = $tempEmail; password = $tempPass }; userField = "username" },
+            @{ body = @{ email = $tempEmail; password = $tempPass; name = $tempUser }; userField = "email" },
+            @{ body = @{ email = $tempEmail; password = $tempPass; password_confirmation = $tempPass }; userField = "email" },
+            @{ body = @{ username = $tempUser; email = $tempEmail; password = $tempPass; confirmPassword = $tempPass }; userField = "username" }
+        )
+
+        foreach ($ep in $AuthDetection.RegistrationEndpoints) {
+            $regUrl = "${TargetUrl}${ep}"
+            foreach ($attempt in $jsonBodies) {
+                try {
+                    $jsonBody = $attempt.body | ConvertTo-Json -Compress
+                    $resp = Invoke-WebRequest -Uri $regUrl -Method POST -Body $jsonBody -ContentType "application/json" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                    if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300) {
+                        $loginUser = if ($attempt.userField -eq "email") { $tempEmail } else { $tempUser }
+                        Write-Ok "User registered via $ep (HTTP $($resp.StatusCode))"
+                        $result.Success = $true
+                        $result.User = $loginUser
+                        $result.AuthType = "json"
+                        $result.CleanupInfo = @{
+                            Method = "api"
+                            Url    = $TargetUrl
+                            User   = $loginUser
+                            Token  = $null  # Will be populated if we get a token back
+                        }
+                        # Try to extract token from response for API-based cleanup later
+                        try {
+                            $respBody = $resp.Content | ConvertFrom-Json -ErrorAction Stop
+                            if ($respBody.token) { $result.CleanupInfo.Token = $respBody.token }
+                            elseif ($respBody.access_token) { $result.CleanupInfo.Token = $respBody.access_token }
+                            elseif ($respBody.accessToken) { $result.CleanupInfo.Token = $respBody.accessToken }
+                        } catch {}
+
+                        # Find the best login URL
+                        if ($AuthDetection.LoginEndpoints.Count -gt 0) {
+                            $result.LoginUrl = "${TargetUrl}$($AuthDetection.LoginEndpoints[0])"
+                        }
+                        return $result
+                    }
+                } catch {
+                    $sc = 0
+                    if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
+                    Write-VerboseLog "Registration attempt $ep failed (HTTP $sc): $($_.Exception.Message)"
+                }
+            }
+
+            # Try form-based registration
+            $eu = [uri]::EscapeDataString($tempUser)
+            $ee = [uri]::EscapeDataString($tempEmail)
+            $ep2 = [uri]::EscapeDataString($tempPass)
+            $amp = '&'
+            $formBodies = @(
+                "username=${eu}${amp}email=${ee}${amp}password=${ep2}",
+                "email=${ee}${amp}password=${ep2}${amp}password_confirmation=${ep2}"
+            )
+            foreach ($formBody in $formBodies) {
+                try {
+                    $resp = Invoke-WebRequest -Uri $regUrl -Method POST -Body $formBody -ContentType "application/x-www-form-urlencoded" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                    if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) {
+                        Write-Ok "User registered via $ep - form - HTTP $($resp.StatusCode)"
+                        $result.Success = $true
+                        $result.User = $tempEmail
+                        $result.AuthType = "form"
+                        $result.CleanupInfo = @{ Method = "api"; Url = $TargetUrl; User = $tempEmail }
+                        if ($AuthDetection.LoginEndpoints.Count -gt 0) {
+                            $result.LoginUrl = "${TargetUrl}$($AuthDetection.LoginEndpoints[0])"
+                        }
+                        return $result
+                    }
+                } catch {}
+            }
+        }
+    }
+
+    # ---- Strategy 3: Spring Boot default user ----
+    if ($hint -eq "spring-boot") {
+        Write-Detail "Spring Boot detected - checking for default security user..."
+        # Spring Boot generates a random password on startup when spring-security is on classpath
+        # The password is printed to stdout: Using generated security password: [uuid]
+        # For auto-auth, we can set properties before the app starts
+        $result.User = "user"
+        $result.Password = "zappass"
+        $result.AuthType = "form"
+        $result.LoginUrl = "${TargetUrl}/login"
+        $result.CleanupInfo = @{ Method = "spring-boot" }
+        Write-Warn "Spring Boot: Set spring.security.user.name=user and spring.security.user.password=zappass"
+        Write-Warn "in application.properties before starting the app for auto-auth to work."
+        Write-Warn "Alternatively, re-run with -AuthUser and -AuthPassword."
+        # Don't set Success=true since we can't inject at this point (app is already running)
+    }
+
+    if (-not $result.Success) {
+        Write-Warn "Could not provision a temporary user automatically."
+        Write-Warn "Tip: Use -AuthUser/-AuthPassword to provide existing credentials,"
+        Write-Warn "     or configure a registration endpoint in the target app."
+    }
+
+    return $result
+}
+
+function Remove-TempUser {
+    <#
+    .SYNOPSIS
+        Removes the temporary test user created by Provision-TempUser.
+    #>
+    param(
+        [hashtable]$CleanupInfo,
+        [string]$ProjectDir
+    )
+
+    if (-not $CleanupInfo -or $CleanupInfo.Method -eq "none") { return }
+
+    Write-Step "Removing temporary test user..."
+
+    switch ($CleanupInfo.Method) {
+        "django" {
+            try {
+                $managePy = Join-Path $CleanupInfo.ProjectDir "manage.py"
+                $pyCmd = $CleanupInfo.PyCmd
+                $deleteCode = "from django.contrib.auth.models import User; User.objects.filter(username='$($CleanupInfo.Username)').delete(); print('deleted')"
+                $output = & $pyCmd $managePy shell -c "$deleteCode" 2>&1
+                if ($output -match "deleted") {
+                    Write-Ok "Django temp user removed."
+                } else {
+                    Write-Warn "Django user cleanup output: $output"
+                }
+            } catch {
+                Write-Warn "Failed to remove Django temp user: $($_.Exception.Message)"
+            }
+        }
+        "laravel" {
+            try {
+                $artisan = Join-Path $CleanupInfo.ProjectDir "artisan"
+                $deleteCode = '\App\Models\User::where(''email'',''__EMAIL__'')->delete(); echo ''deleted'';'
+                $deleteCode = $deleteCode.Replace('__EMAIL__', $CleanupInfo.Email)
+                $output = & php $artisan tinker ("--execute=" + $deleteCode) 2>&1
+                if ($output -match "deleted") {
+                    Write-Ok "Laravel temp user removed."
+                } else {
+                    Write-Warn "Laravel user cleanup output: $output"
+                }
+            } catch {
+                Write-Warn "Failed to remove Laravel temp user: $($_.Exception.Message)"
+            }
+        }
+        "wordpress" {
+            try {
+                & wp user delete $CleanupInfo.Username --yes --path="$($CleanupInfo.ProjectDir)" 2>&1 | Out-Null
+                Write-Ok "WordPress temp user removed."
+            } catch {
+                Write-Warn "Failed to remove WordPress temp user: $($_.Exception.Message)"
+            }
+        }
+        "rails" {
+            try {
+                Push-Location $CleanupInfo.ProjectDir
+                $rubyCode = "u = User.find_by(email: '$($CleanupInfo.Email)'); u.destroy! if u"
+                & bundle exec rails runner "$rubyCode" 2>&1 | Out-Null
+                Pop-Location
+                Write-Ok "Rails temp user removed."
+            } catch {
+                Write-Warn "Failed to remove Rails temp user: $($_.Exception.Message)"
+                Pop-Location -ErrorAction SilentlyContinue
+            }
+        }
+        "api" {
+            # Best-effort: try DELETE endpoints if we have a token
+            if ($CleanupInfo.Token) {
+                foreach ($ep in @("/api/auth/user", "/api/user", "/api/users/me", "/api/auth/account")) {
+                    try {
+                        $headers = @{ "Authorization" = "Bearer $($CleanupInfo.Token)" }
+                        Invoke-WebRequest -Uri "$($CleanupInfo.Url)$ep" -Method DELETE -Headers $headers -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop | Out-Null
+                        Write-Ok "API temp user removed via DELETE $ep"
+                        return
+                    } catch {}
+                }
+            }
+            Write-Warn "Could not remove API-created temp user automatically. Manual cleanup may be needed."
+        }
+        "spring-boot" {
+            Write-Detail "Spring Boot: no cleanup needed (in-memory user)."
+        }
+    }
+}
+
+# =============================================================
+# PHASE 3b: Authenticated Scanning (ZAP Configuration)
 # =============================================================
 function Configure-ZapAuth {
     param(
@@ -3603,6 +4256,7 @@ if (-not $TargetUrl) {
         if ($script:Config.authPassword -and -not $AuthPassword) { $AuthPassword = $script:Config.authPassword }
         if ($script:Config.authUrl -and -not $AuthUrl)           { $AuthUrl = $script:Config.authUrl }
         if ($script:Config.authType -and -not $AuthType)         { $AuthType = $script:Config.authType }
+        if ($script:Config.autoAuth -and -not $AutoAuth.IsPresent) { $AutoAuth = [switch]::new($true) }
     }
 
     Write-Ok "Detected: $($framework.Name)"
@@ -3744,7 +4398,7 @@ if (-not $TargetUrl) {
         Write-DryRun "Target URL      : $TargetUrl"
         Write-DryRun "ZAP mode        : $(if ($script:UsingDockerZap) { 'Docker' } else { 'Local' })"
         Write-DryRun "Database        : $(if ($script:DetectedDbType) { $script:DetectedDbType } else { 'None' })"
-        Write-DryRun "Auth            : $(if ($AuthUser -or $AuthToken) { 'Yes' } else { 'None' })"
+        Write-DryRun "Auth            : $(if ($AuthUser -or $AuthToken) { 'Yes' } elseif ($AutoAuth.IsPresent) { 'Auto (will detect and provision)' } else { 'None' })"
         Write-DryRun "Full scan       : $($FullScan.IsPresent)"
         if ($script:FallbacksTriggered.Count -gt 0) {
             Write-DryRun "Fallbacks       : $($script:FallbacksTriggered -join '; ')"
@@ -3939,7 +4593,36 @@ Import-GraphqlSchema -TargetUrl $TargetUrl
 Write-Host ""
 
 # --- Step 9: Configure authentication ---
-Write-Step "STEP 9: Configuring authentication..."
+# Auto-auth: detect, provision temp user, then configure ZAP
+if ($AutoAuth.IsPresent -and -not $AuthUser -and -not $AuthToken) {
+    Write-Step "STEP 9a: Auto-auth - detecting authentication requirements..."
+    $authDetection = Detect-AuthRequirement -TargetUrl $TargetUrl -ProjectDir $script:OriginalDir -Framework $framework
+
+    if ($authDetection.Required) {
+        Write-Ok "Authentication required - attempting to provision temp user..."
+        $autoAuthResult = Provision-TempUser -TargetUrl $TargetUrl -ProjectDir $script:OriginalDir -Framework $framework -AuthDetection $authDetection
+
+        if ($autoAuthResult.Success) {
+            # Inject provisioned credentials into the auth flow
+            $AuthUser     = $autoAuthResult.User
+            $AuthPassword = $autoAuthResult.Password
+            $AuthType     = $autoAuthResult.AuthType
+            if ($autoAuthResult.LoginUrl) { $AuthUrl = $autoAuthResult.LoginUrl }
+
+            $script:AutoAuthProvisioned = $true
+            $script:AutoAuthCleanupInfo = $autoAuthResult.CleanupInfo
+
+            Write-Ok "Auto-auth: temp user ready ($AuthUser) - proceeding with authenticated scan."
+        } else {
+            Write-Warn "Auto-auth: could not create temp user. Falling back to unauthenticated scan."
+        }
+    } else {
+        Write-Ok "Auto-auth: app does not appear to require authentication. Scanning unauthenticated."
+    }
+    Write-Host ""
+}
+
+Write-Step "STEP 9b: Configuring ZAP authentication..."
 Configure-ZapAuth -TargetUrl $TargetUrl -ProjectDir $script:OriginalDir
 Write-Host ""
 
@@ -4212,6 +4895,7 @@ $jsonReport = @{
         apiSpec      = $script:ApiSpecSource
         fallbacks    = $script:FallbacksTriggered
         auth         = if ($script:AuthResult) { $script:AuthResult.Type } else { "none" }
+        autoAuth     = $script:AutoAuthProvisioned
     }
     summary = @{
         total         = $total
