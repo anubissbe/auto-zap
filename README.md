@@ -1,7 +1,7 @@
 # Auto-ZAP
 
 [![GitHub Marketplace](https://img.shields.io/badge/Marketplace-Auto--ZAP-blue?logo=github)](https://github.com/marketplace/actions/auto-zap-security-scanner)
-[![CI Pipeline](https://github.com/bert-euraika/auto-zap/actions/workflows/ci.yml/badge.svg)](https://github.com/bert-euraika/auto-zap/actions/workflows/ci.yml)
+[![CI Pipeline](https://github.com/anubissbe/auto-zap/actions/workflows/ci.yml/badge.svg)](https://github.com/anubissbe/auto-zap/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.txt)
 
 **Fully automated OWASP ZAP security scanner for web applications.**
@@ -12,7 +12,7 @@ Drop it into any project, and Auto-ZAP detects your framework, starts your datab
 
 - **Zero-config** - Detects 13 runtimes and 30+ frameworks automatically
 - **Cross-platform** - Windows (PowerShell), Linux/macOS (Bash + Docker)
-- **GitHub Action** - Use as `bert-euraika/auto-zap@v1` in any workflow
+- **GitHub Action** - Use as `anubissbe/auto-zap@v1` in any workflow
 - **Full pipeline** - Database provisioning, dependency install, migrations, app startup, scan, reports
 - **Authenticated scanning** - Form, JSON, or Bearer token auth with auto-detection
 - **Multiple reports** - HTML, JSON, and SARIF output formats
@@ -25,13 +25,13 @@ Drop it into any project, and Auto-ZAP detects your framework, starts your datab
 ### GitHub Actions
 
 ```yaml
-- uses: bert-euraika/auto-zap@v1
+- uses: anubissbe/auto-zap@v1
 ```
 
 That's it. Auto-ZAP detects your framework, starts your app, scans it, and outputs vulnerability counts. Add options as needed:
 
 ```yaml
-- uses: bert-euraika/auto-zap@v1
+- uses: anubissbe/auto-zap@v1
   id: scan
   with:
     full-scan: true
@@ -186,7 +186,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bert-euraika/auto-zap@v1
+      - uses: anubissbe/auto-zap@v1
 ```
 
 ### With Options
@@ -194,7 +194,7 @@ jobs:
 ```yaml
 - name: Run security scan
   id: scan
-  uses: bert-euraika/auto-zap@v1
+  uses: anubissbe/auto-zap@v1
   with:
     url: 'http://localhost:3000'
     full-scan: true
@@ -211,7 +211,7 @@ jobs:
 ### Upload Reports as Artifacts
 
 ```yaml
-- uses: bert-euraika/auto-zap@v1
+- uses: anubissbe/auto-zap@v1
   id: scan
 
 - uses: actions/upload-artifact@v4
@@ -235,7 +235,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bert-euraika/auto-zap@v1
+      - uses: anubissbe/auto-zap@v1
         with:
           full-scan: true
 ```
@@ -243,7 +243,7 @@ jobs:
 ### Fail on Vulnerabilities
 
 ```yaml
-- uses: bert-euraika/auto-zap@v1
+- uses: anubissbe/auto-zap@v1
   id: scan
 
 - name: Fail if HIGH vulnerabilities found
@@ -337,12 +337,12 @@ Options:
 
 #### Windows Installer (recommended)
 
-Download from the [GitHub Releases](https://github.com/bert-euraika/auto-zap/releases/latest) page:
+Download from the [GitHub Releases](https://github.com/anubissbe/auto-zap/releases/latest) page:
 
 | Download | Description |
 |----------|-------------|
-| [Auto-ZAP-Setup.exe](https://github.com/bert-euraika/auto-zap/releases/latest/download/Auto-ZAP-Setup.exe) | Full installer (~112 MB) with bundled ZAP + Java |
-| [auto-zap.ps1](https://github.com/bert-euraika/auto-zap/releases/latest/download/auto-zap.ps1) | Standalone script (requires ZAP + Java separately) |
+| [Auto-ZAP-Setup.exe](https://github.com/anubissbe/auto-zap/releases/latest/download/Auto-ZAP-Setup.exe) | Full installer (~112 MB) with bundled ZAP + Java |
+| [auto-zap.ps1](https://github.com/anubissbe/auto-zap/releases/latest/download/auto-zap.ps1) | Standalone script (requires ZAP + Java separately) |
 
 The installer bundles:
 - `auto-zap.ps1` - The scanner script
@@ -354,7 +354,7 @@ After installation, `auto-zap.cmd` is available from any directory (added to sys
 #### Manual Installation
 
 ```powershell
-git clone https://github.com/bert-euraika/auto-zap.git
+git clone https://github.com/anubissbe/auto-zap.git
 cd auto-zap
 
 # Install ZAP and Java separately
@@ -647,8 +647,8 @@ Auto-ZAP handles ZAP API port conflicts automatically. For the app port, use `-P
 
 | Document | Description |
 |----------|-------------|
-| [Auto-ZAP-Presentation.pptx](https://github.com/bert-euraika/auto-zap/releases/latest/download/Auto-ZAP-Presentation.pptx) | Project overview slide deck (10 slides) |
-| [Auto-ZAP-Technical-Specification.docx](https://github.com/bert-euraika/auto-zap/releases/latest/download/Auto-ZAP-Technical-Specification.docx) | Technical specification document |
+| [Auto-ZAP-Presentation.pptx](https://github.com/anubissbe/auto-zap/releases/latest/download/Auto-ZAP-Presentation.pptx) | Project overview slide deck (10 slides) |
+| [Auto-ZAP-Technical-Specification.docx](https://github.com/anubissbe/auto-zap/releases/latest/download/Auto-ZAP-Technical-Specification.docx) | Technical specification document |
 
 ---
 

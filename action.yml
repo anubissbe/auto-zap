@@ -1,6 +1,6 @@
 name: 'Auto-ZAP Security Scanner'
 description: 'Zero-config OWASP ZAP security scanner. Auto-detects 30+ frameworks, databases, and auth.'
-author: 'bert-euraika'
+author: 'anubissbe'
 
 branding:
   icon: 'shield'
