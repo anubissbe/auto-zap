@@ -526,7 +526,8 @@ provision_temp_user() {
             done
 
             # Try form-based registration
-            local form_body="username=$(urlencode "$AUTO_AUTH_USER")&email=$(urlencode "$AUTO_AUTH_EMAIL")&password=$(urlencode "$AUTO_AUTH_PASS")"
+            local form_body
+            form_body="username=$(urlencode "$AUTO_AUTH_USER")&email=$(urlencode "$AUTO_AUTH_EMAIL")&password=$(urlencode "$AUTO_AUTH_PASS")"
             local http_code
             http_code=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 10 -X POST \
                 -H "Content-Type: application/x-www-form-urlencoded" \
