@@ -273,10 +273,10 @@ jobs:
           echo "Checking README.md sections..."
           ERRORS=0
 
-          for section in "Installation" "Quick Start" "Supported Frameworks" "Parameters" \
-                         "Authentication" "How It Works" "Reports" "Linux" "GitHub Actions" \
-                         "Prerequisites" "Troubleshooting"; do
-            if grep -q "## $section" README.md || grep -q "## $section" README.md; then
+          for section in "Quick Start" "Supported Frameworks" "GitHub Actions" \
+                         "Linux" "Windows" "Authentication" "How It Works" \
+                         "Reports" "Configuration File" "Troubleshooting"; do
+            if grep -qi "## .*$section" README.md; then
               echo "  PASS: Section '$section' found"
             else
               echo "  FAIL: Section '$section' missing"
@@ -296,7 +296,7 @@ jobs:
           ERRORS=0
 
           # Check links resolve (HEAD request)
-          for url in $(grep -oP 'https://github.com/bert-euraika/auto-zap/releases/[^\s\)]+' README.md | head -10); do
+          for url in $(grep -oP 'https://github.com/[^/]+/auto-zap/releases/[^\s\)]+' README.md | head -10); do
             HTTP_CODE=$(curl -sL -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
             if [[ "$HTTP_CODE" =~ ^(200|302)$ ]]; then
               echo "  PASS ($HTTP_CODE): $url"
@@ -308,7 +308,7 @@ jobs:
       - name: Check required files exist
         run: |
           ERRORS=0
-          for f in auto-zap.ps1 auto-zap.sh action.yml README.md LICENSE.txt \
+          for f in auto-zap.ps1 auto-zap.sh action.yml README.md LICENSE \
                    build/build.ps1 build/installer.nsi \
                    .github/workflows/security-scan.yml .github/workflows/ci.yml; do
             if [[ -f "$f" ]]; then
