@@ -22,8 +22,10 @@ KEEP_DOCKER=false
 SKIP_INSTALL=false
 AUTH_USER=""
 AUTH_PASSWORD=""
+# shellcheck disable=SC2034 # reserved for auth endpoint detection
 AUTH_URL=""
 AUTH_TOKEN=""
+# shellcheck disable=SC2034 # reserved for auth type routing
 AUTH_TYPE=""
 
 # ---- State ----
@@ -634,7 +636,6 @@ CONTEXT_RESP=$(zap_api "/JSON/context/action/newContext/?contextName=$CONTEXT_NA
 CONTEXT_ID=$(echo "$CONTEXT_RESP" | jq -r '.contextId')
 
 # Include target in context
-ENCODED_URL=$(urlencode "$URL")
 INCLUDE_REGEX=$(urlencode "${URL}.*")
 zap_api "/JSON/context/action/includeInContext/?contextName=$CONTEXT_NAME&regex=$INCLUDE_REGEX" >/dev/null
 
@@ -675,7 +676,6 @@ echo ""
 # ============================================================
 if [[ -n "$AUTH_TOKEN" ]]; then
     log_step "STEP 9: Configuring Bearer token authentication..."
-    HEADER_ENCODED=$(urlencode "Authorization: Bearer $AUTH_TOKEN")
     zap_api "/JSON/replacer/action/addRule/?description=AuthToken&enabled=true&matchType=REQ_HEADER&matchRegex=false&matchString=Authorization&replacement=Bearer%20$AUTH_TOKEN" >/dev/null 2>&1 || true
     log_ok "Bearer token configured."
     echo ""
@@ -721,7 +721,7 @@ SPIDER_URL=$(urlencode "$URL")
 SPIDER_RESP=$(zap_api "/JSON/spider/action/scan/?url=$SPIDER_URL&maxChildren=0&recurse=true&subtreeOnly=false&contextName=$CONTEXT_NAME")
 SPIDER_ID=$(echo "$SPIDER_RESP" | jq -r '.scan')
 
-SPIDER_TIMEOUT=$((FULL_SCAN == true ? 600 : 180))
+SPIDER_TIMEOUT=$( [[ "$FULL_SCAN" == "true" ]] && echo 600 || echo 180 )
 SPIDER_ELAPSED=0
 while true; do
     SPIDER_STATUS=$(zap_api "/JSON/spider/view/status/?scanId=$SPIDER_ID" | jq -r '.status')
@@ -745,7 +745,7 @@ log_step "Phase 2/3: Ajax spider (JavaScript-rendered content)..."
 AJAX_RESP=$(zap_api "/JSON/ajaxSpider/action/scan/?url=$SPIDER_URL&contextName=$CONTEXT_NAME" 2>/dev/null) || true
 
 if [[ -n "$AJAX_RESP" ]]; then
-    AJAX_TIMEOUT=$((FULL_SCAN == true ? 300 : 120))
+    AJAX_TIMEOUT=$( [[ "$FULL_SCAN" == "true" ]] && echo 300 || echo 120 )
     AJAX_ELAPSED=0
     while true; do
         AJAX_STATUS=$(zap_api "/JSON/ajaxSpider/view/status/" | jq -r '.status')
@@ -771,7 +771,7 @@ log_step "Phase 3/3: Active vulnerability scan..."
 SCAN_RESP=$(zap_api "/JSON/ascan/action/scan/?url=$SPIDER_URL&recurse=true&inScopeOnly=false&contextId=$CONTEXT_ID")
 SCAN_ID=$(echo "$SCAN_RESP" | jq -r '.scan')
 
-SCAN_TIMEOUT=$((FULL_SCAN == true ? 3600 : 1800))
+SCAN_TIMEOUT=$( [[ "$FULL_SCAN" == "true" ]] && echo 3600 || echo 1800 )
 SCAN_ELAPSED=0
 STALL_COUNT=0
 LAST_PROGRESS=-1
