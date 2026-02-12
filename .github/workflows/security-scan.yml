@@ -36,7 +36,7 @@ jobs:
         if: hashFiles('**/package-lock.json', '**/yarn.lock', '**/pnpm-lock.yaml', '**/bun.lockb') != ''
         uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Setup Python
         if: hashFiles('**/requirements.txt', '**/pyproject.toml', '**/Pipfile') != ''
