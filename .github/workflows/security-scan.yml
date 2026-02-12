@@ -69,7 +69,7 @@ jobs:
       # Upload reports as artifacts
       - name: Upload HTML report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: zap-security-report-html
           path: zap-report-*.html
@@ -78,7 +78,7 @@ jobs:
 
       - name: Upload JSON report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: zap-security-report-json
           path: zap-report-*.json
