@@ -2,7 +2,7 @@
 
 [![GitHub Marketplace](https://img.shields.io/badge/Marketplace-Auto--ZAP-blue?logo=github)](https://github.com/marketplace/actions/auto-zap-security-scanner)
 [![CI Pipeline](https://github.com/anubissbe/auto-zap/actions/workflows/ci.yml/badge.svg)](https://github.com/anubissbe/auto-zap/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.txt)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Fully automated OWASP ZAP security scanner for web applications.**
 
@@ -654,7 +654,7 @@ Auto-ZAP handles ZAP API port conflicts automatically. For the app port, use `-P
 
 ## License
 
-MIT License - see [LICENSE.txt](LICENSE.txt).
+MIT License - see [LICENSE](LICENSE).
 
 This project bundles [OWASP ZAP](https://www.zaproxy.org/) (Apache 2.0) and [Eclipse Temurin JRE 17](https://adoptium.net/) (GPLv2 with Classpath Exception) in the installer.
 
