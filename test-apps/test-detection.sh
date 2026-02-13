@@ -33,12 +33,20 @@ TESTS=(
     "java-spring|Spring Boot|8080"
     "docker-app|Docker|3000"
     "static-html|Static HTML|8080"
+    "dotnet-aspnet|ASP.NET|5000"
+    "php-laravel|Laravel|8000"
+    "php-wordpress|WordPress|8080"
+    "ruby-rails|Rails|3000"
+    "elixir-phoenix|Phoenix|4000"
+    "rust-web|Rust|8080"
+    "deno-web|Deno|8000"
 )
 
 TOTAL=0
 PASS=0
 FAIL=0
 
+# shellcheck disable=SC2329  # used via trap
 cleanup() {
     rm -rf "$WSL_TMP" 2>/dev/null || true
 }
@@ -76,9 +84,9 @@ for test_def in "${TESTS[@]}"; do
 
     # Run auto-zap.sh with a 30s timeout - enough for detection + start of install
     # It will likely fail or timeout during install/start, which is fine
-    cd "$test_dir" || return 1
+    cd "$test_dir" || continue
     timeout 30 bash "$AUTO_ZAP" > "$log_file" 2>&1 || true
-    cd "$SCRIPT_DIR" || return 1
+    cd "$SCRIPT_DIR" || exit 1
 
     # Check detection
     detected=$(grep -o 'Detected: .*' "$log_file" 2>/dev/null | head -1 | sed 's/Detected: //')

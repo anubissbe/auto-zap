@@ -46,8 +46,6 @@ START_PASS=0
 START_FAIL=0
 SCAN_PASS=0
 SCAN_FAIL=0
-SKIPPED=0  # exported for summary display
-export SKIPPED
 
 declare -A RESULT_DETECT
 declare -A RESULT_START
@@ -55,6 +53,7 @@ declare -A RESULT_SCAN
 declare -A RESULT_NOTES
 
 # ---- Cleanup ----
+# shellcheck disable=SC2329  # used via trap
 cleanup() {
     echo ""
     echo -e "${CYAN}[*] Cleaning up test environment...${NC}"
