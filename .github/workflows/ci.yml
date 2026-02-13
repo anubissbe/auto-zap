@@ -201,7 +201,7 @@ jobs:
 
       - name: Cache ZAP install
         id: zap-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.auto-zap/zap
           key: zap-crossplatform-${{ runner.os }}
