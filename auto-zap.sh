@@ -28,7 +28,6 @@ AUTH_TOKEN=""
 AUTH_TYPE=""
 AUTO_AUTH=false
 SARIF=false
-USE_DOCKER_ZAP=true  # Bash version always uses Docker ZAP
 DRY_RUN=false
 VERBOSE_LOG=false
 SCAN_MODE="auto"
@@ -83,7 +82,6 @@ while [[ $# -gt 0 ]]; do
         --auth-type)        AUTH_TYPE="$2"; shift 2 ;;
         --auto-auth|-a)     AUTO_AUTH=true; shift ;;
         --sarif)            SARIF=true; shift ;;
-        --use-docker-zap)   USE_DOCKER_ZAP=true; shift ;;
         --dry-run)          DRY_RUN=true; shift ;;
         --verbose|-v)       VERBOSE_LOG=true; shift ;;
         --scan-mode)        SCAN_MODE="$2"; shift 2 ;;
@@ -104,7 +102,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --auth-type TYPE       form, json, or bearer"
             echo "  --auto-auth, -a        Auto-create temp user for authenticated scanning"
             echo "  --sarif                Generate SARIF report for GitHub Code Scanning"
-            echo "  --use-docker-zap       Use Docker-based ZAP (default, always enabled on Linux)"
             echo "  --dry-run              Show what would happen without executing"
             echo "  --verbose, -v          Enable verbose debug logging"
             echo "  --scan-mode MODE       Scan mode: auto, webapp, api, static"
@@ -989,6 +986,8 @@ else
         fi
 
     # --- PHP ---
+    elif [[ -f "wp-config.php" ]]; then
+        FRAMEWORK="PHP - WordPress"; RUNTIME="PHP"; APP_PORT=8080; START_COMMAND="php -S 0.0.0.0:8080"
     elif [[ -f "artisan" ]]; then
         FRAMEWORK="PHP - Laravel"; RUNTIME="PHP"; APP_PORT=8000; START_COMMAND="php artisan serve --host=0.0.0.0"
     elif [[ -f "symfony.lock" ]]; then
@@ -1071,9 +1070,56 @@ else
     log_detail "Command: $START_COMMAND"
     echo ""
 
+    # ---- Dry-run exit point (before any side effects) ----
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo ""
+        log_dryrun "=== DRY RUN SUMMARY ==="
+        log_dryrun "Framework       : ${FRAMEWORK:-None}"
+        log_dryrun "Runtime         : ${RUNTIME:-None}"
+        log_dryrun "Scan mode       : $SCAN_MODE"
+        log_dryrun "Start command   : ${START_COMMAND:-N/A}"
+        log_dryrun "Target URL      : $URL"
+        log_dryrun "ZAP mode        : Docker"
+        log_dryrun "Auth            : $(if [[ -n "$AUTH_USER" || -n "$AUTH_TOKEN" ]]; then echo 'Yes'; elif [[ "$AUTO_AUTH" == "true" ]]; then echo 'Auto'; else echo 'None'; fi)"
+        log_dryrun "Full scan       : $FULL_SCAN"
+        log_dryrun ""
+        log_dryrun "Would execute:"
+        log_dryrun "  1. Provision database (if needed)"
+        log_dryrun "  2. Install dependencies"
+        log_dryrun "  3. Run migrations"
+        log_dryrun "  4. Start app: ${START_COMMAND:-N/A}"
+        log_dryrun "  5. Start ZAP on port $ZAP_API_PORT"
+        log_dryrun "  6. Configure context + technology filter"
+        log_dryrun "  7. Import API specs (if found)"
+        log_dryrun "  8. Run spider + active vulnerability scan"
+        log_dryrun "  9. Generate reports"
+        log_dryrun " 10. Cleanup all processes"
+        log_ok "Dry run complete. No actions performed."
+        exit 0
+    fi
+
     # ============================================================
     # STEP 2: Database
     # ============================================================
+
+    # Handle compose config from .auto-zap.json (start Docker Compose before DB check)
+    if [[ -n "$CONFIG_FILE" ]]; then
+        cfg_compose_file=$(jq -r '.compose.file // empty' "$CONFIG_FILE" 2>/dev/null)
+        cfg_compose_services=$(jq -r '.compose.services // [] | join(" ")' "$CONFIG_FILE" 2>/dev/null)
+        if [[ -n "$cfg_compose_file" && -f "$cfg_compose_file" ]]; then
+            log_step "STEP 2: Starting Docker Compose services (from config)..."
+            if [[ -n "$cfg_compose_services" ]]; then
+                docker compose -f "$cfg_compose_file" up -d $cfg_compose_services 2>/dev/null || docker-compose -f "$cfg_compose_file" up -d $cfg_compose_services 2>/dev/null || log_warn "Compose start had errors."
+            else
+                docker compose -f "$cfg_compose_file" up -d 2>/dev/null || docker-compose -f "$cfg_compose_file" up -d 2>/dev/null || log_warn "Compose start had errors."
+            fi
+            COMPOSE_STARTED=true
+            sleep 5
+            log_ok "Docker Compose services started (from config)."
+            echo ""
+        fi
+    fi
+
     DB_URL="${DATABASE_URL:-}"
 
     if [[ -n "$DB_URL" ]]; then
@@ -1222,7 +1268,27 @@ else
     # ============================================================
     MIGRATIONS_RAN=false
 
-    if [[ -d "prisma" ]] && [[ -f "prisma/schema.prisma" ]]; then
+    # Config-defined migrations override auto-detection
+    if [[ -n "$CONFIG_FILE" ]]; then
+        cfg_mig_count=$(jq -r '.migrations // [] | length' "$CONFIG_FILE" 2>/dev/null)
+        if [[ "${cfg_mig_count:-0}" -gt 0 ]]; then
+            log_step "STEP 4: Running migrations (from config)..."
+            for i in $(seq 0 $((cfg_mig_count - 1))); do
+                mig_cmd=$(jq -r ".migrations[$i]" "$CONFIG_FILE" 2>/dev/null)
+                log_detail "Migration: $mig_cmd"
+                if ! eval "$mig_cmd" 2>&1; then
+                    log_err "Migration failed: $mig_cmd"
+                    log_detail "Fix: Run '$mig_cmd' manually to debug."
+                    exit 1
+                fi
+            done
+            MIGRATIONS_RAN=true
+            log_ok "Config migrations complete."
+            echo ""
+        fi
+    fi
+
+    if [[ "$MIGRATIONS_RAN" != "true" ]] && [[ -d "prisma" ]] && [[ -f "prisma/schema.prisma" ]]; then
         log_step "STEP 4: Running Prisma migrations..."
         PM=$(detect_pm 2>/dev/null || echo "npx")
         [[ "$PM" == "npx" ]] || PM="$PM exec"
@@ -1307,6 +1373,25 @@ else
     fi
 
     # ============================================================
+    # STEP 4c: Pre-start hooks from config
+    # ============================================================
+    if [[ -n "$CONFIG_FILE" ]]; then
+        pre_count=$(jq -r '.preStart // [] | length' "$CONFIG_FILE" 2>/dev/null)
+        if [[ "${pre_count:-0}" -gt 0 ]]; then
+            log_step "STEP 4c: Running pre-start hooks..."
+            for i in $(seq 0 $((pre_count - 1))); do
+                pre_cmd=$(jq -r ".preStart[$i]" "$CONFIG_FILE" 2>/dev/null)
+                log_detail "Pre-start: $pre_cmd"
+                if ! eval "$pre_cmd" 2>&1; then
+                    log_warn "Pre-start hook failed: $pre_cmd (continuing)"
+                fi
+            done
+            log_ok "Pre-start hooks complete."
+            echo ""
+        fi
+    fi
+
+    # ============================================================
     # STEP 5: Start application
     # ============================================================
     log_step "STEP 5: Starting web application..."
@@ -1315,37 +1400,27 @@ else
     eval "$START_COMMAND" &>/dev/null &
     APP_PID=$!
 
-    if ! wait_for_url "$URL" 180 "$FRAMEWORK"; then
+    # Use healthCheckUrl from config if set
+    HEALTH_CHECK_URL="$URL"
+    if [[ -n "$CONFIG_FILE" ]]; then
+        cfg_health=$(jq -r '.healthCheckUrl // empty' "$CONFIG_FILE" 2>/dev/null)
+        if [[ -n "$cfg_health" ]]; then
+            # Support both absolute URLs and relative paths
+            if [[ "$cfg_health" == http* ]]; then
+                HEALTH_CHECK_URL="$cfg_health"
+            else
+                HEALTH_CHECK_URL="${URL}${cfg_health}"
+            fi
+            log_detail "Using health check URL from config: $HEALTH_CHECK_URL"
+        fi
+    fi
+
+    if ! wait_for_url "$HEALTH_CHECK_URL" 180 "$FRAMEWORK"; then
         log_err "Application failed to start."
         log_detail "Check your start command: $START_COMMAND"
         exit 1
     fi
     echo ""
-fi
-
-# ---- Dry-run exit point ----
-if [[ "$DRY_RUN" == "true" ]]; then
-    echo ""
-    log_dryrun "=== DRY RUN SUMMARY ==="
-    log_dryrun "Framework       : ${FRAMEWORK:-None}"
-    log_dryrun "Runtime         : ${RUNTIME:-None}"
-    log_dryrun "Scan mode       : $SCAN_MODE"
-    log_dryrun "Start command   : ${START_COMMAND:-N/A}"
-    log_dryrun "Target URL      : ${URL:-http://localhost:$APP_PORT}"
-    log_dryrun "ZAP mode        : Docker"
-    log_dryrun "Auth            : $(if [[ -n "$AUTH_USER" || -n "$AUTH_TOKEN" ]]; then echo 'Yes'; elif [[ "$AUTO_AUTH" == "true" ]]; then echo 'Auto'; else echo 'None'; fi)"
-    log_dryrun "Full scan       : $FULL_SCAN"
-    log_dryrun ""
-    log_dryrun "Would execute:"
-    log_dryrun "  1. Start app: ${START_COMMAND:-N/A}"
-    log_dryrun "  2. Start ZAP on port $ZAP_API_PORT"
-    log_dryrun "  3. Configure context + technology filter"
-    log_dryrun "  4. Import API specs (if found)"
-    log_dryrun "  5. Run spider + active vulnerability scan"
-    log_dryrun "  6. Generate reports"
-    log_dryrun "  7. Cleanup all processes"
-    log_ok "Dry run complete. No scanning performed."
-    exit 0
 fi
 
 # ============================================================
@@ -1368,11 +1443,22 @@ docker rm -f "$ZAP_CONTAINER_NAME" >/dev/null 2>&1 || true
 log_detail "Pulling ZAP Docker image (if needed)..."
 docker pull "$ZAP_DOCKER_IMAGE" 2>&1 | tail -1
 
-# Start ZAP container with host networking
+# Detect OS for Docker networking strategy
+# Linux supports --network host; macOS does not, so we use port mapping + host.docker.internal
+ZAP_DOCKER_NETWORK_ARGS=()
+ZAP_TARGET_HOST="localhost"
+if [[ "$(uname -s)" == "Linux" ]]; then
+    ZAP_DOCKER_NETWORK_ARGS=(--network host)
+else
+    # macOS/other: use port mapping; app is accessible via host.docker.internal from inside container
+    ZAP_DOCKER_NETWORK_ARGS=(-p "$ZAP_API_PORT:$ZAP_API_PORT")
+    ZAP_TARGET_HOST="host.docker.internal"
+fi
+
 log_detail "Starting ZAP container..."
 docker run -d \
     --name "$ZAP_CONTAINER_NAME" \
-    --network host \
+    "${ZAP_DOCKER_NETWORK_ARGS[@]}" \
     -v "$ORIGINAL_DIR:/zap/wrk:rw" \
     "$ZAP_DOCKER_IMAGE" \
     zap.sh -daemon -port "$ZAP_API_PORT" \
@@ -1402,9 +1488,14 @@ if [[ -z "$CONTEXT_ID" || "$CONTEXT_ID" == "null" ]]; then
     exit 1
 fi
 
-# Include target in context
-INCLUDE_REGEX=$(urlencode "${URL}.*")
+# Include target in context (use ZAP-reachable URL)
+INCLUDE_REGEX=$(urlencode "${ZAP_SCAN_URL}.*")
 zap_api "/JSON/context/action/includeInContext/?contextName=$CONTEXT_NAME&regex=$INCLUDE_REGEX" >/dev/null
+# Also include localhost variant if using host.docker.internal
+if [[ "$ZAP_TARGET_HOST" != "localhost" ]]; then
+    INCLUDE_REGEX_LOCAL=$(urlencode "${URL}.*")
+    zap_api "/JSON/context/action/includeInContext/?contextName=$CONTEXT_NAME&regex=$INCLUDE_REGEX_LOCAL" >/dev/null 2>&1 || true
+fi
 
 # Exclude common non-app paths (static assets)
 for exclude in ".*\\.js$" ".*\\.css$" ".*\\.png$" ".*\\.jpg$" ".*\\.gif$" ".*\\.svg$" ".*\\.woff2?$" ".*\\.ico$" \
@@ -1444,9 +1535,10 @@ log_step "STEP 8: Checking for API specifications..."
 API_SPEC_FOUND=false
 for spec_path in "swagger.json" "swagger.yaml" "openapi.json" "openapi.yaml" "api-docs.json"; do
     SPEC_URL="$URL/$spec_path"
+    ZAP_SPEC_URL="$ZAP_SCAN_URL/$spec_path"
     if curl -sf -o /dev/null "$SPEC_URL" 2>/dev/null; then
         log_detail "Found OpenAPI spec at $SPEC_URL"
-        ENCODED_SPEC=$(urlencode "$SPEC_URL")
+        ENCODED_SPEC=$(urlencode "$ZAP_SPEC_URL")
         if zap_api "/JSON/openapi/action/importUrl/?url=$ENCODED_SPEC&contextId=$CONTEXT_ID" >/dev/null 2>&1; then
             API_SPEC_FOUND=true
             log_ok "OpenAPI spec imported."
@@ -1459,6 +1551,45 @@ done
 
 if [[ "$API_SPEC_FOUND" != "true" ]]; then
     log_detail "No API spec found (checked swagger.json, openapi.json, etc.)"
+fi
+
+# ---- GraphQL schema import ----
+GRAPHQL_DETECTED=false
+# Check if project uses GraphQL
+if [[ -f "package.json" ]] && grep -qE '"(graphql|@apollo|@nestjs/graphql|type-graphql|graphql-yoga|mercurius)"' package.json 2>/dev/null; then
+    GRAPHQL_DETECTED=true
+elif [[ -f "requirements.txt" ]] && grep -qiE '(graphene|strawberry|ariadne)' requirements.txt 2>/dev/null; then
+    GRAPHQL_DETECTED=true
+elif [[ -f "Gemfile" ]] && grep -q 'graphql' Gemfile 2>/dev/null; then
+    GRAPHQL_DETECTED=true
+fi
+
+if [[ "$GRAPHQL_DETECTED" == "true" ]]; then
+    log_step "GraphQL detected. Attempting schema import..."
+    GRAPHQL_IMPORTED=false
+    for gql_ep in /graphql /api/graphql /graphql/v1; do
+        GQL_TEST_URL="${URL}${gql_ep}"
+        GQL_ZAP_URL="${ZAP_SCAN_URL}${gql_ep}"
+        # Test if endpoint responds to introspection
+        GQL_RESP=$(curl -sf --max-time 5 -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"query":"{ __typename }"}' \
+            "$GQL_TEST_URL" 2>/dev/null) || true
+        if [[ -n "$GQL_RESP" ]] && echo "$GQL_RESP" | jq -e '.data' &>/dev/null; then
+            log_detail "GraphQL endpoint found at: $gql_ep"
+            ENCODED_GQL=$(urlencode "$GQL_ZAP_URL")
+            if zap_api "/JSON/graphql/action/importUrl/?url=$ENCODED_GQL&endpointUrl=$ENCODED_GQL&contextId=$CONTEXT_ID" >/dev/null 2>&1; then
+                log_ok "Imported GraphQL schema from: $gql_ep"
+                GRAPHQL_IMPORTED=true
+                break
+            else
+                log_warn "ZAP failed to import GraphQL schema."
+            fi
+        fi
+    done
+    if [[ "$GRAPHQL_IMPORTED" != "true" ]]; then
+        log_detail "Could not import GraphQL schema automatically."
+    fi
 fi
 echo ""
 
@@ -1651,9 +1782,20 @@ echo -e "${CYAN}     SCANNING: $URL${NC}"
 echo -e "${CYAN}============================================================${NC}"
 echo ""
 
+# Build the URL that ZAP (inside Docker) should use to reach the app
+ZAP_SCAN_URL="${URL//localhost/$ZAP_TARGET_HOST}"
+ZAP_SCAN_URL="${ZAP_SCAN_URL//127.0.0.1/$ZAP_TARGET_HOST}"
+
 # ---- Phase 1: Spider ----
+# Skip spider for API-only mode (rely on OpenAPI/GraphQL spec import)
+if [[ "$SCAN_MODE" == "api" ]]; then
+    log_step "Phase 1/3: Skipped spider (API-only scan mode — relies on API spec import)."
+    SPIDER_RESULTS=0
+else
 log_step "Phase 1/3: Spidering (crawling the application)..."
-SPIDER_URL=$(urlencode "$URL")
+fi
+SPIDER_URL=$(urlencode "$ZAP_SCAN_URL")
+if [[ "$SCAN_MODE" != "api" ]]; then
 SPIDER_RESP=$(zap_api "/JSON/spider/action/scan/?url=$SPIDER_URL&maxChildren=0&recurse=true&subtreeOnly=false&contextName=$CONTEXT_NAME" 2>/dev/null) || true
 SPIDER_ID=$(echo "${SPIDER_RESP:-}" | jq -r '.scan' 2>/dev/null) || true
 if [[ -z "$SPIDER_ID" || "$SPIDER_ID" == "null" ]]; then
@@ -1679,9 +1821,13 @@ done
 echo ""
 SPIDER_RESULTS=$(zap_api "/JSON/spider/view/results/?scanId=$SPIDER_ID" 2>/dev/null | jq '.results | length' 2>/dev/null) || SPIDER_RESULTS=0
 log_ok "Spider found $SPIDER_RESULTS URLs."
+fi  # end SCAN_MODE != api
 echo ""
 
 # ---- Phase 2: Ajax Spider ----
+if [[ "$SCAN_MODE" == "api" || "$SCAN_MODE" == "static" ]]; then
+    log_step "Phase 2/3: Skipped Ajax spider ($SCAN_MODE scan mode)."
+else
 log_step "Phase 2/3: Ajax spider (JavaScript-rendered content)..."
 AJAX_RESP=$(zap_api "/JSON/ajaxSpider/action/scan/?url=$SPIDER_URL&contextName=$CONTEXT_NAME" 2>/dev/null) || true
 
@@ -1705,9 +1851,14 @@ if [[ -n "$AJAX_RESP" ]]; then
 else
     log_detail "Ajax spider not available (browser add-on may be missing)."
 fi
+fi  # end SCAN_MODE != api/static
 echo ""
 
 # ---- Phase 3: Active Scan ----
+if [[ "$SCAN_MODE" == "static" ]]; then
+    log_step "Phase 3/3: Skipped active scan (static scan mode — passive results only)."
+    echo ""
+else
 log_step "Phase 3/3: Active vulnerability scan..."
 SCAN_PARAMS="url=$SPIDER_URL&recurse=true&inScopeOnly=false&contextId=$CONTEXT_ID"
 [[ -n "$SCAN_POLICY_NAME" ]] && SCAN_PARAMS="${SCAN_PARAMS}&scanPolicyName=$SCAN_POLICY_NAME"
@@ -1752,6 +1903,7 @@ while true; do
 done
 echo ""
 log_ok "Active scan complete."
+fi  # end SCAN_MODE != static
 echo ""
 
 # ============================================================
@@ -1801,9 +1953,9 @@ INFO=$(echo "$ALERTS_JSON" | jq '[.alerts[] | select(.risk=="0" or .risk=="Infor
 [[ "$LOW" =~ ^[0-9]+$ ]] || LOW=0
 [[ "$INFO" =~ ^[0-9]+$ ]] || INFO=0
 
-# Generate SARIF report (if requested)
-if [[ "$SARIF" == "true" ]]; then
-    log_step "Generating SARIF report..."
+# Generate SARIF report (always generated for CI compatibility; --sarif flag is now default behavior)
+log_step "Generating SARIF report..."
+{
     # Build SARIF JSON from ZAP alerts
     SARIF_JSON=$(echo "$ALERTS_JSON" | jq --arg target_url "$URL" '{
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
@@ -1845,7 +1997,7 @@ if [[ "$SARIF" == "true" ]]; then
     else
         log_warn "Failed to generate SARIF report."
     fi
-fi
+}
 
 echo ""
 echo -e "${WHITE}    Vulnerability Summary${NC}"
@@ -1866,7 +2018,7 @@ echo "    --------------------------------------------------"
 echo ""
 echo -e "    HTML Report  : ${WHITE}$REPORT_PATH${NC}"
 echo -e "    JSON Report  : ${WHITE}$JSON_PATH${NC}"
-[[ "$SARIF" == "true" && -s "$SARIF_PATH" ]] && echo -e "    SARIF Report : ${WHITE}$SARIF_PATH${NC}"
+[[ -s "$SARIF_PATH" ]] && echo -e "    SARIF Report : ${WHITE}$SARIF_PATH${NC}"
 echo ""
 
 # ============================================================

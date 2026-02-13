@@ -1,0 +1,6 @@
+{
+  "name": "test-express",
+  "version": "1.0.0",
+  "scripts": { "start": "node index.js" },
+  "dependencies": { "express": "^5.0.0" }
+}

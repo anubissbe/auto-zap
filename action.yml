@@ -55,6 +55,18 @@ inputs:
     description: 'Automatically detect auth, create a temp user, and run an authenticated scan'
     required: false
     default: 'false'
+  scan-mode:
+    description: 'Scan mode: auto (default), webapp, api, or static'
+    required: false
+    default: 'auto'
+  verbose:
+    description: 'Enable verbose debug logging'
+    required: false
+    default: 'false'
+  dry-run:
+    description: 'Show what would happen without executing any scan'
+    required: false
+    default: 'false'
   working-directory:
     description: 'Working directory for the scan (default: repository root)'
     required: false
@@ -67,6 +79,9 @@ outputs:
   json-path:
     description: 'Path to the generated JSON report'
     value: ${{ steps.results.outputs.json-path }}
+  sarif-path:
+    description: 'Path to the generated SARIF report'
+    value: ${{ steps.results.outputs.sarif-path }}
   high-count:
     description: 'Number of HIGH severity vulnerabilities'
     value: ${{ steps.results.outputs.high-count }}
@@ -105,15 +120,20 @@ runs:
         if [[ -n "${{ inputs.auth-token }}" ]]; then ARGS+=(--auth-token "${{ inputs.auth-token }}"); fi
         if [[ -n "${{ inputs.auth-type }}" ]]; then ARGS+=(--auth-type "${{ inputs.auth-type }}"); fi
         if [[ "${{ inputs.auto-auth }}" == "true" ]]; then ARGS+=(--auto-auth); fi
+        if [[ -n "${{ inputs.scan-mode }}" && "${{ inputs.scan-mode }}" != "auto" ]]; then ARGS+=(--scan-mode "${{ inputs.scan-mode }}"); fi
+        if [[ "${{ inputs.verbose }}" == "true" ]]; then ARGS+=(--verbose); fi
+        if [[ "${{ inputs.dry-run }}" == "true" ]]; then ARGS+=(--dry-run); fi
 
         "${{ github.action_path }}/auto-zap.sh" "${ARGS[@]}" || EXIT_CODE=$?
 
         # Capture report paths
         REPORT=$(ls zap-report-*.html 2>/dev/null | head -1 || echo "")
         JSON=$(ls zap-report-*.json 2>/dev/null | head -1 || echo "")
+        SARIF=$(ls zap-report-*.sarif 2>/dev/null | head -1 || echo "")
 
         echo "report-path=$REPORT" >> $GITHUB_OUTPUT
         echo "json-path=$JSON" >> $GITHUB_OUTPUT
+        echo "sarif-path=$SARIF" >> $GITHUB_OUTPUT
 
         # Parse counts
         if [[ -f "$JSON" ]]; then
@@ -148,15 +168,20 @@ runs:
         if ("${{ inputs.auth-token }}") { $scanArgs += @("-AuthToken", "${{ inputs.auth-token }}") }
         if ("${{ inputs.auth-type }}") { $scanArgs += @("-AuthType", "${{ inputs.auth-type }}") }
         if ("${{ inputs.auto-auth }}" -eq "true") { $scanArgs += "-AutoAuth" }
+        if ("${{ inputs.scan-mode }}" -and "${{ inputs.scan-mode }}" -ne "auto") { $scanArgs += @("-ScanMode", "${{ inputs.scan-mode }}") }
+        if ("${{ inputs.verbose }}" -eq "true") { $scanArgs += "-VerboseLog" }
+        if ("${{ inputs.dry-run }}" -eq "true") { $scanArgs += "-DryRun" }
 
         & "${{ github.action_path }}/auto-zap.ps1" @scanArgs
 
         # Capture report paths
         $report = Get-ChildItem -Filter "zap-report-*.html" -ErrorAction SilentlyContinue | Select-Object -First 1
         $json = Get-ChildItem -Filter "zap-report-*.json" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $sarif = Get-ChildItem -Filter "zap-report-*.sarif" -ErrorAction SilentlyContinue | Select-Object -First 1
 
         "report-path=$($report.Name)" >> $env:GITHUB_OUTPUT
         "json-path=$($json.Name)" >> $env:GITHUB_OUTPUT
+        "sarif-path=$($sarif.Name)" >> $env:GITHUB_OUTPUT
 
         if ($json -and (Test-Path $json.FullName)) {
           $alerts = (Get-Content $json.FullName | ConvertFrom-Json).alerts
@@ -178,12 +203,14 @@ runs:
         if [[ "$RUNNER_OS" == "Linux" ]]; then
           echo "report-path=${{ steps.scan-linux.outputs.report-path }}" >> $GITHUB_OUTPUT
           echo "json-path=${{ steps.scan-linux.outputs.json-path }}" >> $GITHUB_OUTPUT
+          echo "sarif-path=${{ steps.scan-linux.outputs.sarif-path }}" >> $GITHUB_OUTPUT
           echo "high-count=${{ steps.scan-linux.outputs.high-count }}" >> $GITHUB_OUTPUT
           echo "medium-count=${{ steps.scan-linux.outputs.medium-count }}" >> $GITHUB_OUTPUT
           echo "low-count=${{ steps.scan-linux.outputs.low-count }}" >> $GITHUB_OUTPUT
         else
           echo "report-path=${{ steps.scan-windows.outputs.report-path }}" >> $GITHUB_OUTPUT
           echo "json-path=${{ steps.scan-windows.outputs.json-path }}" >> $GITHUB_OUTPUT
+          echo "sarif-path=${{ steps.scan-windows.outputs.sarif-path }}" >> $GITHUB_OUTPUT
           echo "high-count=${{ steps.scan-windows.outputs.high-count }}" >> $GITHUB_OUTPUT
           echo "medium-count=${{ steps.scan-windows.outputs.medium-count }}" >> $GITHUB_OUTPUT
           echo "low-count=${{ steps.scan-windows.outputs.low-count }}" >> $GITHUB_OUTPUT

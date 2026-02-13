@@ -1,0 +1,4 @@
+#!/usr/bin/env php
+<?php
+// Laravel artisan stub for framework detection
+echo "Laravel Framework\n";

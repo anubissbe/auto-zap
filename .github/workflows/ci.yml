@@ -123,6 +123,9 @@ jobs:
           - name: "Missing Docker target"
             cmd: "./auto-zap.sh --url http://localhost:19999"
             expect_exit: 1
+          - name: "Dry run (static-html)"
+            cmd: "cd test-apps/static-html && ../../auto-zap.sh --dry-run"
+            expect_exit: 0
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -372,6 +375,7 @@ jobs:
             "pom.xml:Maven/Spring"
             "build.gradle:Gradle/Spring"
             "artisan:Laravel"
+            "wp-config.php:WordPress"
             "composer.json:PHP"
             "Gemfile:Ruby/Rails"
             "go.mod:Go"
@@ -439,6 +443,8 @@ jobs:
             "context/action/includeInContext"
             "core/other/htmlreport"
             "core/action/shutdown"
+            "graphql/action/importUrl"
+            "openapi/action/importUrl"
           )
 
           for ep in "${ENDPOINTS[@]}"; do

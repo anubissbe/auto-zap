@@ -1,0 +1,6 @@
+{
+  "name": "test-nestjs",
+  "version": "1.0.0",
+  "scripts": { "start:dev": "nest start --watch", "start": "node dist/main" },
+  "dependencies": { "@nestjs/core": "^11.0.0", "@nestjs/common": "^11.0.0", "@nestjs/platform-express": "^11.0.0" }
+}

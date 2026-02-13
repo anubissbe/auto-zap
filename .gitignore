@@ -40,5 +40,8 @@ test-apps/**/node_modules/
 test-apps/**/.venv/
 test-apps/**/db.sqlite3
 
+# Test runner results
+tests/results/
+
 # Research documents (not part of release)
 research-*.md

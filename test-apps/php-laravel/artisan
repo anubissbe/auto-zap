@@ -1,0 +1,4 @@
+#!/usr/bin/env php
+<?php
+// Minimal Laravel artisan stub for framework detection
+echo "Laravel artisan stub\n";

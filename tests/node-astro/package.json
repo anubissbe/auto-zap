@@ -1,0 +1,6 @@
+{
+  "name": "test-astro",
+  "version": "1.0.0",
+  "scripts": { "dev": "astro dev", "start": "astro preview" },
+  "dependencies": { "astro": "^5.0.0" }
+}
