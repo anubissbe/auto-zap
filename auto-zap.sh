@@ -48,7 +48,6 @@ INSTALL_DIR=""
 SERVICE_PIDS=()
 CONFIG_FILE=""
 AUTO_AUTH_CREATED=false
-AUTO_AUTH_CLEANUP_CMD=""
 
 # ---- Colors ----
 RED='\033[0;31m'
@@ -416,7 +415,6 @@ provision_temp_user() {
     AUTO_AUTH_EMAIL="zapuser-${rand}@test.local"
     AUTO_AUTH_PASS="ZapTest-${rand}!1"
     AUTO_AUTH_CREATED=false
-    AUTO_AUTH_CLEANUP_CMD=""
     AUTO_AUTH_CLEANUP_METHOD=""
     AUTO_AUTH_CLEANUP_DIR=""
     AUTO_AUTH_CLEANUP_ID=""
