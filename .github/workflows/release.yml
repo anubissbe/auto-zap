@@ -37,34 +37,42 @@ jobs:
         run: |
           $zapUrl = "https://github.com/zaproxy/zaproxy/releases/download/v2.16.1/ZAP_2.16.1_Core.zip"
           $zapZip = "build/staging/zap.zip"
-          New-Item -ItemType Directory -Path "build/staging/zap" -Force | Out-Null
+          New-Item -ItemType Directory -Path "build/staging" -Force | Out-Null
           Write-Host "Downloading ZAP from $zapUrl ..."
           Invoke-WebRequest -Uri $zapUrl -OutFile $zapZip -UseBasicParsing
           Write-Host "Extracting ZAP..."
-          Expand-Archive -Path $zapZip -DestinationPath "build/staging" -Force
-          $zapSubDir = Get-ChildItem "build/staging" -Directory | Where-Object { $_.Name -match "^ZAP" } | Select-Object -First 1
-          if ($zapSubDir) {
-            Get-ChildItem $zapSubDir.FullName | Move-Item -Destination "build/staging/zap" -Force
-            Remove-Item $zapSubDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zapZip -DestinationPath "build/staging/zap-extract" -Force
+          # Move contents to build/staging/zap (flatten one level if needed)
+          $subDir = Get-ChildItem "build/staging/zap-extract" -Directory | Select-Object -First 1
+          if ($subDir) {
+            Move-Item $subDir.FullName "build/staging/zap"
+          } else {
+            Move-Item "build/staging/zap-extract" "build/staging/zap"
           }
-          Write-Host "ZAP extracted to build/staging/zap"
+          Remove-Item "build/staging/zap-extract" -Recurse -Force -ErrorAction SilentlyContinue
+          $fileCount = (Get-ChildItem "build/staging/zap" -Recurse -File).Count
+          Write-Host "ZAP extracted to build/staging/zap ($fileCount files)"
 
       - name: Download Eclipse Temurin JRE 17
         shell: pwsh
         run: |
           $jreUrl = "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jre/hotspot/normal/eclipse?project=jdk"
           $jreZip = "build/staging/jre.zip"
-          New-Item -ItemType Directory -Path "build/staging/jre" -Force | Out-Null
+          New-Item -ItemType Directory -Path "build/staging" -Force | Out-Null
           Write-Host "Downloading Temurin JRE 17..."
           Invoke-WebRequest -Uri $jreUrl -OutFile $jreZip -UseBasicParsing
           Write-Host "Extracting JRE..."
-          Expand-Archive -Path $jreZip -DestinationPath "build/staging" -Force
-          $jreSubDir = Get-ChildItem "build/staging" -Directory | Where-Object { $_.Name -match "^jdk-17" } | Select-Object -First 1
-          if ($jreSubDir) {
-            Get-ChildItem $jreSubDir.FullName | Move-Item -Destination "build/staging/jre" -Force
-            Remove-Item $jreSubDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $jreZip -DestinationPath "build/staging/jre-extract" -Force
+          # Move contents to build/staging/jre (flatten one level if needed)
+          $subDir = Get-ChildItem "build/staging/jre-extract" -Directory | Select-Object -First 1
+          if ($subDir) {
+            Move-Item $subDir.FullName "build/staging/jre"
+          } else {
+            Move-Item "build/staging/jre-extract" "build/staging/jre"
           }
-          Write-Host "JRE extracted to build/staging/jre"
+          Remove-Item "build/staging/jre-extract" -Recurse -Force -ErrorAction SilentlyContinue
+          $fileCount = (Get-ChildItem "build/staging/jre" -Recurse -File).Count
+          Write-Host "JRE extracted to build/staging/jre ($fileCount files)"
 
       - name: Build installer
         shell: pwsh
