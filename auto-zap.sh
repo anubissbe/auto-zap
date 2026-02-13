@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # Auto-ZAP - Automated OWASP ZAP Security Scanner (Linux/macOS)
-# Uses Docker-based ZAP for scanning web applications
+# Supports local ZAP (Java) and Docker-based ZAP for scanning web applications
 # ============================================================
 set -euo pipefail
 
@@ -12,6 +12,15 @@ ZAP_DOCKER_IMAGE="ghcr.io/zaproxy/zaproxy:stable"
 ZAP_CONTAINER_NAME="auto-zap-$$"
 ORIGINAL_DIR=$(pwd)
 TIMESTAMP=$(date +"%Y-%m-%d_%H%M%S")
+
+# ---- ZAP Mode ----
+ZAP_MODE=""
+ZAP_PID=""
+ZAP_JAR=""
+ZAP_HOME=""
+DOCKER_AVAILABLE=false
+JAVA_AVAILABLE=false
+JAVA_CMD=""
 
 # ---- Defaults ----
 URL=""
@@ -31,6 +40,7 @@ SARIF=false
 DRY_RUN=false
 VERBOSE_LOG=false
 SCAN_MODE="auto"
+USE_DOCKER_ZAP=false
 
 # ---- State ----
 APP_PID=""
@@ -85,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)          DRY_RUN=true; shift ;;
         --verbose|-v)       VERBOSE_LOG=true; shift ;;
         --scan-mode)        SCAN_MODE="$2"; shift 2 ;;
+        --use-docker-zap)   USE_DOCKER_ZAP=true; shift ;;
         --help|-h)
             echo "Usage: auto-zap.sh [options]"
             echo ""
@@ -105,6 +116,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --dry-run              Show what would happen without executing"
             echo "  --verbose, -v          Enable verbose debug logging"
             echo "  --scan-mode MODE       Scan mode: auto, webapp, api, static"
+            echo "  --use-docker-zap       Force Docker-based ZAP (skip local detection)"
             echo "  --help, -h             Show this help"
             exit 0
             ;;
@@ -135,12 +147,26 @@ cleanup() {
         wait "$APP_PID" 2>/dev/null || true
     fi
 
-    # Shutdown ZAP via API first, then force-remove container
-    if docker ps -q -f "name=$ZAP_CONTAINER_NAME" 2>/dev/null | grep -q .; then
-        log_detail "Shutting down ZAP..."
+    # Shutdown ZAP
+    if [[ "$ZAP_MODE" == "local" ]] && [[ -n "$ZAP_PID" ]]; then
+        log_detail "Shutting down local ZAP (PID $ZAP_PID)..."
         curl -sf "http://localhost:$ZAP_API_PORT/JSON/core/action/shutdown/?apikey=$ZAP_API_KEY" >/dev/null 2>&1 || true
         sleep 2
-        docker rm -f "$ZAP_CONTAINER_NAME" >/dev/null 2>&1 || true
+        if kill -0 "$ZAP_PID" 2>/dev/null; then
+            kill "$ZAP_PID" 2>/dev/null || true
+            sleep 2
+        fi
+        if kill -0 "$ZAP_PID" 2>/dev/null; then
+            kill -9 "$ZAP_PID" 2>/dev/null || true
+        fi
+        wait "$ZAP_PID" 2>/dev/null || true
+    elif [[ "$ZAP_MODE" == "docker" ]] || [[ -z "$ZAP_MODE" ]]; then
+        if docker ps -q -f "name=$ZAP_CONTAINER_NAME" 2>/dev/null | grep -q .; then
+            log_detail "Shutting down ZAP Docker container..."
+            curl -sf "http://localhost:$ZAP_API_PORT/JSON/core/action/shutdown/?apikey=$ZAP_API_KEY" >/dev/null 2>&1 || true
+            sleep 2
+            docker rm -f "$ZAP_CONTAINER_NAME" >/dev/null 2>&1 || true
+        fi
     fi
 
     # Stop database containers
@@ -228,6 +254,81 @@ urlencode() {
     printf '%s' "$string" | jq -sRr @uri 2>/dev/null \
         || python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))" <<< "$string" 2>/dev/null \
         || printf '%s' "$string"
+}
+
+# ---- Helper: Find local ZAP installation ----
+find_local_zap() {
+    local search_paths=(
+        "/usr/share/zaproxy"
+        "/opt/zaproxy"
+        "/snap/zaproxy/current"
+        "$HOME/.ZAP"
+        "$HOME/.auto-zap/zap"
+    )
+    # Add ZAP_HOME env var if set
+    [[ -n "${ZAP_HOME:-}" ]] && search_paths=("$ZAP_HOME" "${search_paths[@]}")
+
+    # Check if zap.sh is on PATH
+    local zap_sh_path
+    zap_sh_path=$(command -v zap.sh 2>/dev/null) || true
+    if [[ -n "$zap_sh_path" ]]; then
+        local zap_dir
+        zap_dir=$(dirname "$zap_sh_path")
+        search_paths=("$zap_dir" "${search_paths[@]}")
+    fi
+
+    for dir in "${search_paths[@]}"; do
+        [[ -d "$dir" ]] || continue
+        # Look for ZAP JAR files (prefer newest version)
+        local jar
+        jar=$(find "$dir" -maxdepth 2 \( -name "zap-*.jar" -o -name "ZAP_*.jar" \) 2>/dev/null | sort -V | tail -1)
+        if [[ -n "$jar" && -f "$jar" ]]; then
+            ZAP_JAR="$jar"
+            ZAP_HOME="$dir"
+            log_verbose "Found local ZAP: $ZAP_JAR"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---- Helper: Install ZAP JAR from GitHub ----
+install_zap_jar() {
+    if [[ "$JAVA_AVAILABLE" != "true" ]]; then
+        log_warn "Java is required to install/run local ZAP."
+        return 1
+    fi
+
+    local install_dir="$HOME/.auto-zap/zap"
+    mkdir -p "$install_dir"
+
+    log_detail "Downloading latest ZAP from GitHub..."
+    local release_json tag version jar_url jar_path
+    release_json=$(curl -sf --max-time 30 "https://api.github.com/repos/zaproxy/zaproxy/releases/latest" 2>/dev/null) || {
+        log_warn "Failed to query GitHub API for ZAP releases."
+        return 1
+    }
+    tag=$(echo "$release_json" | jq -r '.tag_name' 2>/dev/null) || { log_warn "Failed to parse ZAP release tag."; return 1; }
+    version="${tag#v}"
+    jar_url="https://github.com/zaproxy/zaproxy/releases/download/${tag}/ZAP_${version}_Core.jar"
+    jar_path="$install_dir/zap-${version}.jar"
+
+    if [[ -f "$jar_path" ]]; then
+        log_detail "ZAP $version already downloaded."
+        ZAP_JAR="$jar_path"
+        ZAP_HOME="$install_dir"
+        return 0
+    fi
+
+    curl -fSL --max-time 300 -o "$jar_path" "$jar_url" 2>&1 || {
+        log_warn "Failed to download ZAP JAR from $jar_url"
+        rm -f "$jar_path"
+        return 1
+    }
+    ZAP_JAR="$jar_path"
+    ZAP_HOME="$install_dir"
+    log_ok "Downloaded ZAP $version to $jar_path"
+    return 0
 }
 
 # ---- Auto-Auth: Generate random string ----
@@ -685,8 +786,8 @@ echo ""
 # ============================================================
 log_step "STEP 0: Checking prerequisites..."
 
+# Required tools: curl, jq
 missing=()
-command -v docker &>/dev/null || missing+=("docker")
 command -v curl &>/dev/null   || missing+=("curl")
 command -v jq &>/dev/null     || missing+=("jq")
 
@@ -696,13 +797,57 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     exit 1
 fi
 
-# Check Docker is running
-if ! docker info &>/dev/null; then
-    log_err "Docker daemon is not running. Start it with: sudo systemctl start docker"
-    exit 1
+# Docker: soft-check (informational)
+if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+    DOCKER_AVAILABLE=true
+    log_detail "Docker: available"
+else
+    log_detail "Docker: not available"
 fi
 
-log_ok "Prerequisites OK (docker, curl, jq)"
+# Java: detect for local ZAP mode
+JAVA_CMD=""
+if command -v java &>/dev/null; then
+    JAVA_CMD="java"
+    JAVA_AVAILABLE=true
+    log_detail "Java: available ($(java -version 2>&1 | head -1))"
+elif [[ -n "${JAVA_HOME:-}" ]] && [[ -x "$JAVA_HOME/bin/java" ]]; then
+    JAVA_CMD="$JAVA_HOME/bin/java"
+    JAVA_AVAILABLE=true
+    log_detail "Java: available via JAVA_HOME ($JAVA_HOME)"
+else
+    log_detail "Java: not available"
+fi
+
+log_ok "Prerequisites OK (curl, jq)"
+echo ""
+
+# ---- ZAP mode determination ----
+# Priority: --use-docker-zap → local ZAP → auto-install JAR → Docker fallback → error
+if [[ "$USE_DOCKER_ZAP" == "true" ]]; then
+    if [[ "$DOCKER_AVAILABLE" != "true" ]]; then
+        log_err "--use-docker-zap was specified but Docker is not available."
+        exit 1
+    fi
+    ZAP_MODE="docker"
+    log_ok "ZAP mode: Docker (forced via --use-docker-zap)"
+elif find_local_zap; then
+    ZAP_MODE="local"
+    log_ok "ZAP mode: Local ($ZAP_JAR)"
+elif install_zap_jar; then
+    ZAP_MODE="local"
+    log_ok "ZAP mode: Local (auto-installed: $ZAP_JAR)"
+elif [[ "$DOCKER_AVAILABLE" == "true" ]]; then
+    ZAP_MODE="docker"
+    log_ok "ZAP mode: Docker (fallback — no local ZAP found)"
+else
+    log_err "No ZAP installation found and Docker is not available."
+    log_detail "Options:"
+    log_detail "  1. Install Java (JRE 11+) — ZAP will be auto-downloaded"
+    log_detail "  2. Install Docker — ZAP will run in a container"
+    log_detail "  3. Install ZAP manually: https://www.zaproxy.org/download/"
+    exit 1
+fi
 echo ""
 
 # ============================================================
@@ -1079,7 +1224,7 @@ else
         log_dryrun "Scan mode       : $SCAN_MODE"
         log_dryrun "Start command   : ${START_COMMAND:-N/A}"
         log_dryrun "Target URL      : $URL"
-        log_dryrun "ZAP mode        : Docker"
+        log_dryrun "ZAP mode        : $(if [[ "$ZAP_MODE" == "local" ]]; then echo "Local ($ZAP_JAR)"; else echo "Docker ($ZAP_DOCKER_IMAGE)"; fi)"
         log_dryrun "Auth            : $(if [[ -n "$AUTH_USER" || -n "$AUTH_TOKEN" ]]; then echo 'Yes'; elif [[ "$AUTO_AUTH" == "true" ]]; then echo 'Auto'; else echo 'None'; fi)"
         log_dryrun "Full scan       : $FULL_SCAN"
         log_dryrun ""
@@ -1424,9 +1569,9 @@ else
 fi
 
 # ============================================================
-# STEP 6: Start OWASP ZAP via Docker
+# STEP 6: Start OWASP ZAP
 # ============================================================
-log_step "STEP 6: Starting OWASP ZAP via Docker on port $ZAP_API_PORT..."
+log_step "STEP 6: Starting OWASP ZAP ($ZAP_MODE mode) on port $ZAP_API_PORT..."
 
 # Check if ZAP port is available
 if nc -z localhost "$ZAP_API_PORT" 2>/dev/null || (echo >/dev/tcp/localhost/"$ZAP_API_PORT") 2>/dev/null; then
@@ -1436,43 +1581,66 @@ if nc -z localhost "$ZAP_API_PORT" 2>/dev/null || (echo >/dev/tcp/localhost/"$ZA
     log_detail "Using port $ZAP_API_PORT"
 fi
 
-# Remove any existing container
-docker rm -f "$ZAP_CONTAINER_NAME" >/dev/null 2>&1 || true
-
-# Pull image
-log_detail "Pulling ZAP Docker image (if needed)..."
-docker pull "$ZAP_DOCKER_IMAGE" 2>&1 | tail -1
-
-# Detect OS for Docker networking strategy
-# Linux supports --network host; macOS does not, so we use port mapping + host.docker.internal
-ZAP_DOCKER_NETWORK_ARGS=()
 ZAP_TARGET_HOST="localhost"
-if [[ "$(uname -s)" == "Linux" ]]; then
-    ZAP_DOCKER_NETWORK_ARGS=(--network host)
+
+if [[ "$ZAP_MODE" == "local" ]]; then
+    # ---- Local ZAP (Java process) ----
+    log_detail "Starting local ZAP: $ZAP_JAR"
+    $JAVA_CMD -Xmx512m -jar "$ZAP_JAR" \
+        -daemon -port "$ZAP_API_PORT" \
+        -config api.key="$ZAP_API_KEY" \
+        -config api.addrs.addr.name=.* \
+        -config api.addrs.addr.regex=true \
+        -config connection.timeoutInSecs=120 &
+    ZAP_PID=$!
+    log_detail "ZAP started (PID $ZAP_PID)"
 else
-    # macOS/other: use port mapping; app is accessible via host.docker.internal from inside container
-    ZAP_DOCKER_NETWORK_ARGS=(-p "$ZAP_API_PORT:$ZAP_API_PORT")
-    ZAP_TARGET_HOST="host.docker.internal"
+    # ---- Docker ZAP ----
+    # Remove any existing container
+    docker rm -f "$ZAP_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+    # Pull image
+    log_detail "Pulling ZAP Docker image (if needed)..."
+    docker pull "$ZAP_DOCKER_IMAGE" 2>&1 | tail -1
+
+    # Detect OS for Docker networking strategy
+    # Linux supports --network host; macOS does not, so we use port mapping + host.docker.internal
+    ZAP_DOCKER_NETWORK_ARGS=()
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        ZAP_DOCKER_NETWORK_ARGS=(--network host)
+    else
+        # macOS/other: use port mapping; app is accessible via host.docker.internal from inside container
+        ZAP_DOCKER_NETWORK_ARGS=(-p "$ZAP_API_PORT:$ZAP_API_PORT")
+        ZAP_TARGET_HOST="host.docker.internal"
+    fi
+
+    log_detail "Starting ZAP container..."
+    docker run -d \
+        --name "$ZAP_CONTAINER_NAME" \
+        "${ZAP_DOCKER_NETWORK_ARGS[@]}" \
+        -v "$ORIGINAL_DIR:/zap/wrk:rw" \
+        "$ZAP_DOCKER_IMAGE" \
+        zap.sh -daemon -port "$ZAP_API_PORT" \
+        -config api.key="$ZAP_API_KEY" \
+        -config api.addrs.addr.name=.* \
+        -config api.addrs.addr.regex=true \
+        -config connection.timeoutInSecs=120 >/dev/null || {
+        log_err "Failed to start ZAP Docker container."
+        exit 1
+    }
 fi
 
-log_detail "Starting ZAP container..."
-docker run -d \
-    --name "$ZAP_CONTAINER_NAME" \
-    "${ZAP_DOCKER_NETWORK_ARGS[@]}" \
-    -v "$ORIGINAL_DIR:/zap/wrk:rw" \
-    "$ZAP_DOCKER_IMAGE" \
-    zap.sh -daemon -port "$ZAP_API_PORT" \
-    -config api.key="$ZAP_API_KEY" \
-    -config api.addrs.addr.name=.* \
-    -config api.addrs.addr.regex=true \
-    -config connection.timeoutInSecs=120 >/dev/null || {
-    log_err "Failed to start ZAP Docker container."
-    exit 1
-}
-
 wait_for_url "http://localhost:$ZAP_API_PORT" 120 "ZAP API" || exit 1
-log_ok "ZAP is running on port $ZAP_API_PORT."
+log_ok "ZAP is running on port $ZAP_API_PORT ($ZAP_MODE mode)."
 echo ""
+
+# Build the URL that ZAP should use to reach the app
+if [[ "$ZAP_MODE" == "local" ]]; then
+    ZAP_SCAN_URL="$URL"
+else
+    ZAP_SCAN_URL="${URL//localhost/$ZAP_TARGET_HOST}"
+    ZAP_SCAN_URL="${ZAP_SCAN_URL//127.0.0.1/$ZAP_TARGET_HOST}"
+fi
 
 # ============================================================
 # STEP 7: Configure ZAP context
@@ -1762,7 +1930,7 @@ echo "    --------------------------------------------------"
 echo -e "    Framework    : ${WHITE}${FRAMEWORK:-Unknown}${NC}"
 echo -e "    Target URL   : ${WHITE}$URL${NC}"
 echo -e "    Port         : ${WHITE}$APP_PORT${NC}"
-echo -e "    ZAP Source   : ${WHITE}Docker ($ZAP_DOCKER_IMAGE)${NC}"
+echo -e "    ZAP Source   : ${WHITE}$(if [[ "$ZAP_MODE" == "local" ]]; then echo "Local ($ZAP_JAR)"; else echo "Docker ($ZAP_DOCKER_IMAGE)"; fi)${NC}"
 [[ "$ZAP_API_PORT" -ne 8090 ]] && echo -e "    ZAP Port     : ${YELLOW}$ZAP_API_PORT (dynamic)${NC}"
 echo -e "    Scan Mode    : ${WHITE}$(if [[ "$FULL_SCAN" == "true" ]]; then echo "Full (thorough)"; else echo "Baseline (quick)"; fi)${NC}"
 [[ -n "$SCAN_POLICY_NAME" ]] && echo -e "    Scan Policy  : ${WHITE}$SCAN_POLICY_NAME${NC}"
@@ -1781,10 +1949,6 @@ echo -e "${CYAN}============================================================${NC
 echo -e "${CYAN}     SCANNING: $URL${NC}"
 echo -e "${CYAN}============================================================${NC}"
 echo ""
-
-# Build the URL that ZAP (inside Docker) should use to reach the app
-ZAP_SCAN_URL="${URL//localhost/$ZAP_TARGET_HOST}"
-ZAP_SCAN_URL="${ZAP_SCAN_URL//127.0.0.1/$ZAP_TARGET_HOST}"
 
 # ---- Phase 1: Spider ----
 # Skip spider for API-only mode (rely on OpenAPI/GraphQL spec import)

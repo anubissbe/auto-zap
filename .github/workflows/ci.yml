@@ -120,7 +120,7 @@ jobs:
           - name: "Help flag"
             cmd: "./auto-zap.sh --help"
             expect_exit: 0
-          - name: "Missing Docker target"
+          - name: "Unreachable target URL"
             cmd: "./auto-zap.sh --url http://localhost:19999"
             expect_exit: 1
           - name: "Dry run (static-html)"
@@ -198,6 +198,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Install ZAP for local mode
+        run: |
+          mkdir -p $HOME/.auto-zap/zap
+          RELEASE=$(curl -sf https://api.github.com/repos/zaproxy/zaproxy/releases/latest)
+          TAG=$(echo "$RELEASE" | jq -r '.tag_name')
+          VERSION=${TAG#v}
+          curl -fSL -o "$HOME/.auto-zap/zap/zap-${VERSION}.jar" \
+            "https://github.com/zaproxy/zaproxy/releases/download/${TAG}/ZAP_${VERSION}_Core.jar"
+          ls -lh $HOME/.auto-zap/zap/
+          java -version
 
       - name: Create test app
         run: |
