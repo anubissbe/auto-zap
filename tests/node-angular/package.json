@@ -1,0 +1,6 @@
+{
+  "name": "test-angular",
+  "version": "1.0.0",
+  "scripts": { "start": "ng serve", "build": "ng build" },
+  "dependencies": { "@angular/core": "^19.0.0", "@angular/platform-browser": "^19.0.0" }
+}

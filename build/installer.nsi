@@ -17,11 +17,11 @@ RequestExecutionLevel admin
 SetCompressor lzma
 
 ; ---- Version Info ----
-VIProductVersion "1.4.1.0"
+VIProductVersion "1.4.2.0"
 VIAddVersionKey "ProductName" "Auto-ZAP"
 VIAddVersionKey "CompanyName" "Euraika"
 VIAddVersionKey "FileDescription" "Auto-ZAP - Automated OWASP ZAP Security Scanner"
-VIAddVersionKey "FileVersion" "1.4.1.0"
+VIAddVersionKey "FileVersion" "1.4.2.0"
 VIAddVersionKey "LegalCopyright" "Copyright 2026 Euraika"
 
 ; ---- Interface ----
@@ -75,7 +75,7 @@ Section "Auto-ZAP Core" SecCore
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Auto-ZAP" "UninstallString" '"$INSTDIR\uninstall.exe"'
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Auto-ZAP" "InstallLocation" "$INSTDIR"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Auto-ZAP" "Publisher" "Euraika"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Auto-ZAP" "DisplayVersion" "1.4.1"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Auto-ZAP" "DisplayVersion" "1.4.2"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Auto-ZAP" "URLInfoAbout" "https://github.com/bert-euraika/auto-zap"
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Auto-ZAP" "NoModify" 1
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Auto-ZAP" "NoRepair" 1
