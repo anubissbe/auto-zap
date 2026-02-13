@@ -1668,12 +1668,12 @@ if [[ "$ZAP_MODE" == "local" ]]; then
     log_detail "Starting local ZAP: $ZAP_JAR"
 
     # Scale heap: 1g for full scan, 512m for baseline
-    local zap_heap="512m"
+    zap_heap="512m"
     if [[ "$FULL_SCAN" == "true" ]]; then
         zap_heap="1g"
     fi
 
-    local zap_log="${TMPDIR:-/tmp}/auto-zap-daemon-$$.log"
+    zap_log="${TMPDIR:-/tmp}/auto-zap-daemon-$$.log"
     "$JAVA_CMD" -Xms256m -Xmx"$zap_heap" -jar "$ZAP_JAR" \
         -daemon -port "$ZAP_API_PORT" \
         -config api.key="$ZAP_API_KEY" \
