@@ -179,15 +179,18 @@ if (-not $SkipDownload) {
 
 # ---- Step 3: Create self-signed certificate ----
 Write-Host ""
-Write-Host "[*] Step 3/5: Creating code signing certificate..." -ForegroundColor Cyan
 
 $pfxPath = Join-Path $buildDir "auto-zap-signing.pfx"
 $certSubject = "CN=Auto-ZAP, O=Euraika, L=Belgium, C=BE"
 
-if ($CertPath -and (Test-Path $CertPath)) {
+if ($SkipSign) {
+    Write-Host "[*] Step 3/5: Skipping certificate creation (-SkipSign)." -ForegroundColor Yellow
+} elseif ($CertPath -and (Test-Path $CertPath)) {
+    Write-Host "[*] Step 3/5: Using provided certificate..." -ForegroundColor Cyan
     $pfxPath = $CertPath
     Write-Host "[+] Using provided certificate: $pfxPath" -ForegroundColor Green
 } elseif (-not (Test-Path $pfxPath)) {
+    Write-Host "[*] Step 3/5: Creating code signing certificate..." -ForegroundColor Cyan
     # Create self-signed certificate
     $cert = New-SelfSignedCertificate `
         -Type CodeSigningCert `
@@ -224,6 +227,7 @@ if ($CertPath -and (Test-Path $CertPath)) {
     Write-Host "    NOTE: This is a self-signed certificate." -ForegroundColor Yellow
     Write-Host "    Other computers will see 'Unknown publisher' until they trust this cert." -ForegroundColor Yellow
 } else {
+    Write-Host "[*] Step 3/5: Using existing certificate..." -ForegroundColor Cyan
     Write-Host "[+] Certificate already exists: $pfxPath" -ForegroundColor Green
 }
 
