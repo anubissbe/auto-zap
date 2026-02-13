@@ -11,7 +11,7 @@ Drop it into any project, and Auto-ZAP detects your framework, starts your datab
 ## Features
 
 - **Zero-config** - Detects 13 runtimes and 30+ frameworks automatically
-- **Cross-platform** - Windows (PowerShell), Linux/macOS (Bash + Docker)
+- **Cross-platform** - Windows (PowerShell), Linux/macOS (Bash) with local ZAP or Docker
 - **GitHub Action** - Use as `anubissbe/auto-zap@v1` in any workflow
 - **Full pipeline** - Database provisioning, dependency install, migrations, app startup, scan, reports
 - **Authenticated scanning** - Form, JSON, or Bearer token auth with auto-detection
@@ -51,7 +51,7 @@ chmod +x auto-zap.sh
 ./auto-zap.sh --auto-auth                         # Auto-create temp user + scan
 ```
 
-Requires Docker, curl, and jq.
+Requires curl and jq. ZAP runs locally (Java) or via Docker — auto-detected.
 
 ### Windows
 
@@ -288,19 +288,30 @@ jobs:
 
 | Runner | ZAP Method | Notes |
 |--------|-----------|-------|
-| `ubuntu-latest` | Docker (`ghcr.io/zaproxy/zaproxy:stable`) | Recommended for CI |
+| `ubuntu-latest` | Local (Java) or Docker | Local preferred; Docker as fallback |
 | `windows-latest` | Local PowerShell | Docker containers not supported on Windows runners |
 
 ---
 
 ## Linux / macOS
 
-Auto-ZAP includes a native bash script (`auto-zap.sh`) for Linux and macOS. It uses Docker-based ZAP exclusively - no Java installation needed.
+Auto-ZAP includes a native bash script (`auto-zap.sh`) for Linux and macOS. It supports both local ZAP (Java) and Docker-based ZAP with automatic fallback.
+
+### ZAP Mode (auto-detected)
+
+The script determines how to run ZAP using this priority chain:
+
+1. **`--use-docker-zap` flag** — forces Docker mode
+2. **Local ZAP found** — searches `/usr/share/zaproxy/`, `/opt/zaproxy/`, `/snap/zaproxy/current/`, `$HOME/.ZAP/`, `$HOME/.auto-zap/zap/`, `$ZAP_HOME` env, and `zap.sh` on PATH
+3. **Auto-install** — if Java is available, downloads the latest ZAP from GitHub to `$HOME/.auto-zap/zap/`
+4. **Docker fallback** — uses `ghcr.io/zaproxy/zaproxy:stable` if Docker is available
+5. **Error** — exits with clear instructions if none of the above work
 
 ### Requirements
 
-- **Docker** (for ZAP and optional database containers)
 - **curl** and **jq** (pre-installed on most systems)
+- **One of:** Java 11+ (for local ZAP) **or** Docker (for container-based ZAP)
+- **Docker** (optional, for database containers)
 
 ### CLI Parameters
 
@@ -320,6 +331,11 @@ Options:
   --auth-token TOKEN     Pre-obtained Bearer token
   --auth-type TYPE       form, json, or bearer
   --auto-auth, -a        Auto-create temp user for authenticated scanning
+  --scan-mode MODE       Scan mode: auto, webapp, api, static
+  --use-docker-zap       Force Docker-based ZAP (skip local detection)
+  --sarif                Generate SARIF report for GitHub Code Scanning
+  --dry-run              Show what would happen without executing
+  --verbose, -v          Enable verbose debug logging
   --help, -h             Show help
 ```
 
@@ -327,12 +343,12 @@ Options:
 
 | Feature | Windows (`auto-zap.ps1`) | Linux (`auto-zap.sh`) |
 |---------|--------------------------|----------------------|
-| ZAP method | Local JAR or Docker | Docker only |
-| Java required | Yes (for local ZAP) | No |
+| ZAP method | Local JAR or Docker | Local JAR or Docker |
+| Java required | Yes (for local ZAP) | Yes (for local ZAP) |
 | Process management | `Win32_Process` | `pkill`, `kill` |
 | Port detection | `Get-NetTCPConnection` | `nc -z` |
 | Frameworks | 13 runtimes, 30+ frameworks | Same coverage |
-| Reports | HTML + JSON + SARIF | HTML + JSON |
+| Reports | HTML + JSON + SARIF | HTML + JSON + SARIF |
 
 ---
 
@@ -604,8 +620,8 @@ Supported: PostgreSQL, MySQL, MongoDB, MSSQL, SQLite (no server needed), Redis.
 
 | Mode | How | When |
 |------|-----|------|
-| **Local** | Java process with `zap-*.jar` | ZAP installed locally + Java available |
-| **Docker** | `ghcr.io/zaproxy/zaproxy:stable` | `-UseDockerZap` flag, no local ZAP, or Linux |
+| **Local** | Java process with `zap-*.jar` | ZAP installed locally + Java available (both platforms) |
+| **Docker** | `ghcr.io/zaproxy/zaproxy:stable` | `--use-docker-zap` / `-UseDockerZap` flag, or no local ZAP + no Java |
 
 ### Dynamic Port Allocation
 
@@ -649,7 +665,7 @@ The project includes a comprehensive CI pipeline (`.github/workflows/ci.yml`) wi
 | **Lint & Syntax** | ShellCheck, PSScriptAnalyzer, PowerShell syntax, YAML, NSIS |
 | **Test Linux** (2x) | Help flag behavior + missing target error handling |
 | **Test Windows** | PowerShell syntax validation + parameter checks |
-| **Test Action** | Full integration test with Docker ZAP against a test app |
+| **Test Action** | Full integration test with local ZAP against a test app |
 | **Documentation** | README completeness, download links, input/output cross-references |
 | **Feature Parity** | Compares framework detection, CLI params, and ZAP API usage between `.ps1` and `.sh` |
 | **Security** | Scans for hardcoded secrets and dangerous patterns |
@@ -678,8 +694,9 @@ Auto-ZAP looks for: `package.json`, `requirements.txt`, `pyproject.toml`, `*.csp
 ### "ZAP failed to start"
 
 **Fixes:**
-- Check Java: `java -version` (requires Java 17+)
-- Use Docker: `.\auto-zap.ps1 -UseDockerZap`
+- Check Java: `java -version` (requires Java 11+)
+- Use Docker: `--use-docker-zap` (Linux) or `-UseDockerZap` (Windows)
+- Install ZAP manually: https://www.zaproxy.org/download/
 
 ### "Port XXXX is in use"
 
