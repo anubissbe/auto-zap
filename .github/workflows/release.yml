@@ -68,6 +68,7 @@ jobs:
 
       - name: Build installer
         shell: pwsh
+        timeout-minutes: 15
         run: |
           cd build
           .\build.ps1 -SkipDownload -SkipSign

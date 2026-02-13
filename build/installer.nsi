@@ -14,8 +14,7 @@ OutFile "..\dist\Auto-ZAP-Setup.exe"
 InstallDir "$PROGRAMFILES\Auto-ZAP"
 InstallDirRegKey HKLM "Software\Auto-ZAP" "InstallDir"
 RequestExecutionLevel admin
-SetCompressor /SOLID lzma
-SetCompressorDictSize 64
+SetCompressor lzma
 
 ; ---- Version Info ----
 VIProductVersion "1.0.0.0"
