@@ -292,10 +292,14 @@ find_local_zap() {
     return 1
 }
 
-# ---- Helper: Install ZAP JAR from GitHub ----
+# ---- Helper: Install ZAP from GitHub (Core zip) ----
 install_zap_jar() {
     if [[ "$JAVA_AVAILABLE" != "true" ]]; then
         log_warn "Java is required to install/run local ZAP."
+        return 1
+    fi
+    if ! command -v unzip &>/dev/null; then
+        log_warn "unzip is required to install ZAP."
         return 1
     fi
 
@@ -303,31 +307,53 @@ install_zap_jar() {
     mkdir -p "$install_dir"
 
     log_detail "Downloading latest ZAP from GitHub..."
-    local release_json tag version jar_url jar_path
+    local release_json tag version zip_url zip_path zap_dir
     release_json=$(curl -sf --max-time 30 "https://api.github.com/repos/zaproxy/zaproxy/releases/latest" 2>/dev/null) || {
         log_warn "Failed to query GitHub API for ZAP releases."
         return 1
     }
     tag=$(echo "$release_json" | jq -r '.tag_name' 2>/dev/null) || { log_warn "Failed to parse ZAP release tag."; return 1; }
     version="${tag#v}"
-    jar_url="https://github.com/zaproxy/zaproxy/releases/download/${tag}/ZAP_${version}_Core.jar"
-    jar_path="$install_dir/zap-${version}.jar"
+    zap_dir="$install_dir/ZAP_${version}"
 
-    if [[ -f "$jar_path" ]]; then
-        log_detail "ZAP $version already downloaded."
-        ZAP_JAR="$jar_path"
-        ZAP_HOME="$install_dir"
-        return 0
+    # Check if already extracted
+    if [[ -d "$zap_dir" ]]; then
+        local existing_jar
+        existing_jar=$(find "$zap_dir" -maxdepth 1 \( -name "zap-*.jar" -o -name "ZAP_*.jar" \) 2>/dev/null | head -1)
+        if [[ -n "$existing_jar" && -f "$existing_jar" ]]; then
+            log_detail "ZAP $version already installed."
+            ZAP_JAR="$existing_jar"
+            ZAP_HOME="$zap_dir"
+            return 0
+        fi
     fi
 
-    curl -fSL --max-time 300 -o "$jar_path" "$jar_url" 2>&1 || {
-        log_warn "Failed to download ZAP JAR from $jar_url"
-        rm -f "$jar_path"
+    zip_url="https://github.com/zaproxy/zaproxy/releases/download/${tag}/ZAP_${version}_Crossplatform.zip"
+    zip_path="$install_dir/ZAP_${version}_Crossplatform.zip"
+
+    curl -fSL --max-time 300 -o "$zip_path" "$zip_url" 2>&1 || {
+        log_warn "Failed to download ZAP from $zip_url"
+        rm -f "$zip_path"
         return 1
     }
-    ZAP_JAR="$jar_path"
-    ZAP_HOME="$install_dir"
-    log_ok "Downloaded ZAP $version to $jar_path"
+
+    log_detail "Extracting ZAP..."
+    unzip -qo "$zip_path" -d "$install_dir" 2>&1 || {
+        log_warn "Failed to extract ZAP archive."
+        rm -f "$zip_path"
+        return 1
+    }
+    rm -f "$zip_path"
+
+    local jar
+    jar=$(find "$zap_dir" -maxdepth 1 \( -name "zap-*.jar" -o -name "ZAP_*.jar" \) 2>/dev/null | head -1)
+    if [[ -z "$jar" || ! -f "$jar" ]]; then
+        log_warn "Could not find ZAP JAR in extracted archive."
+        return 1
+    fi
+    ZAP_JAR="$jar"
+    ZAP_HOME="$zap_dir"
+    log_ok "Installed ZAP $version to $zap_dir"
     return 0
 }
 

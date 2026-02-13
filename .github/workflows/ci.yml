@@ -205,9 +205,11 @@ jobs:
           RELEASE=$(curl -sf https://api.github.com/repos/zaproxy/zaproxy/releases/latest)
           TAG=$(echo "$RELEASE" | jq -r '.tag_name')
           VERSION=${TAG#v}
-          curl -fSL -o "$HOME/.auto-zap/zap/zap-${VERSION}.jar" \
-            "https://github.com/zaproxy/zaproxy/releases/download/${TAG}/ZAP_${VERSION}_Core.jar"
-          ls -lh $HOME/.auto-zap/zap/
+          curl -fSL -o "$HOME/.auto-zap/zap/ZAP_${VERSION}_Crossplatform.zip" \
+            "https://github.com/zaproxy/zaproxy/releases/download/${TAG}/ZAP_${VERSION}_Crossplatform.zip"
+          unzip -qo "$HOME/.auto-zap/zap/ZAP_${VERSION}_Crossplatform.zip" -d "$HOME/.auto-zap/zap/"
+          rm -f "$HOME/.auto-zap/zap/ZAP_${VERSION}_Crossplatform.zip"
+          ls -lh "$HOME/.auto-zap/zap/ZAP_${VERSION}/"
           java -version
 
       - name: Create test app
