@@ -17,7 +17,7 @@ TIMESTAMP=$(date +"%Y-%m-%d_%H%M%S")
 ZAP_MODE=""
 ZAP_PID=""
 ZAP_JAR=""
-ZAP_HOME=""
+ZAP_HOME="${ZAP_HOME:-}"
 DOCKER_AVAILABLE=false
 JAVA_AVAILABLE=false
 JAVA_CMD=""
@@ -126,6 +126,7 @@ done
 
 # ---- Cleanup trap ----
 cleanup() {
+    set +e  # Don't exit on errors during cleanup
     echo ""
     log_step "Cleaning up..."
 
@@ -153,6 +154,7 @@ cleanup() {
         curl -sf "http://localhost:$ZAP_API_PORT/JSON/core/action/shutdown/?apikey=$ZAP_API_KEY" >/dev/null 2>&1 || true
         sleep 2
         if kill -0 "$ZAP_PID" 2>/dev/null; then
+            pkill -P "$ZAP_PID" 2>/dev/null || true
             kill "$ZAP_PID" 2>/dev/null || true
             sleep 2
         fi
@@ -160,7 +162,7 @@ cleanup() {
             kill -9 "$ZAP_PID" 2>/dev/null || true
         fi
         wait "$ZAP_PID" 2>/dev/null || true
-    elif [[ "$ZAP_MODE" == "docker" ]] || [[ -z "$ZAP_MODE" ]]; then
+    elif [[ "$ZAP_MODE" == "docker" || -z "$ZAP_MODE" ]] && [[ "$DOCKER_AVAILABLE" == "true" ]]; then
         if docker ps -q -f "name=$ZAP_CONTAINER_NAME" 2>/dev/null | grep -q .; then
             log_detail "Shutting down ZAP Docker container..."
             curl -sf "http://localhost:$ZAP_API_PORT/JSON/core/action/shutdown/?apikey=$ZAP_API_KEY" >/dev/null 2>&1 || true
@@ -268,23 +270,37 @@ find_local_zap() {
     # Add ZAP_HOME env var if set
     [[ -n "${ZAP_HOME:-}" ]] && search_paths=("$ZAP_HOME" "${search_paths[@]}")
 
-    # Check if zap.sh is on PATH
+    # Check if zap.sh is on PATH (resolve symlinks)
     local zap_sh_path
     zap_sh_path=$(command -v zap.sh 2>/dev/null) || true
     if [[ -n "$zap_sh_path" ]]; then
+        # Resolve symlinks: realpath (GNU), readlink -f (Linux), or readlink (macOS)
+        local resolved
+        resolved=$(realpath "$zap_sh_path" 2>/dev/null) \
+            || resolved=$(readlink -f "$zap_sh_path" 2>/dev/null) \
+            || resolved="$zap_sh_path"
         local zap_dir
-        zap_dir=$(dirname "$zap_sh_path")
+        zap_dir=$(dirname "$resolved")
         search_paths=("$zap_dir" "${search_paths[@]}")
+    fi
+
+    log_verbose "ZAP search paths: ${search_paths[*]}"
+
+    # Version sort: sort -V (GNU coreutils) or fallback to sort -t. -k1,1n -k2,2n
+    local sort_cmd="sort -V"
+    if ! echo -e "1.2\n1.10" | sort -V >/dev/null 2>&1; then
+        sort_cmd="sort -t. -k1,1n -k2,2n -k3,3n"
     fi
 
     for dir in "${search_paths[@]}"; do
         [[ -d "$dir" ]] || continue
+        log_verbose "Searching: $dir"
         # Look for ZAP JAR files (prefer newest version)
         local jar
-        jar=$(find "$dir" -maxdepth 2 \( -name "zap-*.jar" -o -name "ZAP_*.jar" \) 2>/dev/null | sort -V | tail -1)
+        jar=$(find "$dir" -maxdepth 2 \( -name "zap-*.jar" -o -name "ZAP_*.jar" \) 2>/dev/null | $sort_cmd | tail -1)
         if [[ -n "$jar" && -f "$jar" ]]; then
             ZAP_JAR="$jar"
-            ZAP_HOME="$dir"
+            ZAP_HOME="$(dirname "$jar")"
             log_verbose "Found local ZAP: $ZAP_JAR"
             return 0
         fi
@@ -292,7 +308,7 @@ find_local_zap() {
     return 1
 }
 
-# ---- Helper: Install ZAP from GitHub (Core zip) ----
+# ---- Helper: Install ZAP from GitHub (Crossplatform zip) ----
 install_zap_jar() {
     if [[ "$JAVA_AVAILABLE" != "true" ]]; then
         log_warn "Java is required to install/run local ZAP."
@@ -306,6 +322,19 @@ install_zap_jar() {
     local install_dir="$HOME/.auto-zap/zap"
     mkdir -p "$install_dir"
 
+    # Check if any cached ZAP install already exists (skip API call)
+    local cached_dir cached_jar
+    cached_dir=$(find "$install_dir" -maxdepth 1 -type d -name "ZAP_*" 2>/dev/null | sort -V | tail -1)
+    if [[ -n "$cached_dir" && -d "$cached_dir" ]]; then
+        cached_jar=$(find "$cached_dir" -maxdepth 1 \( -name "zap-*.jar" -o -name "ZAP_*.jar" \) 2>/dev/null | head -1)
+        if [[ -n "$cached_jar" && -f "$cached_jar" ]]; then
+            log_detail "Using cached ZAP: $cached_dir"
+            ZAP_JAR="$cached_jar"
+            ZAP_HOME="$cached_dir"
+            return 0
+        fi
+    fi
+
     log_detail "Downloading latest ZAP from GitHub..."
     local release_json tag version zip_url zip_path zap_dir
     release_json=$(curl -sf --max-time 30 "https://api.github.com/repos/zaproxy/zaproxy/releases/latest" 2>/dev/null) || {
@@ -313,10 +342,21 @@ install_zap_jar() {
         return 1
     }
     tag=$(echo "$release_json" | jq -r '.tag_name' 2>/dev/null) || { log_warn "Failed to parse ZAP release tag."; return 1; }
+
+    # Validate tag is non-empty and looks like a version
+    if [[ -z "$tag" || "$tag" == "null" ]]; then
+        log_warn "GitHub API returned empty or null release tag."
+        return 1
+    fi
+    if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+ ]]; then
+        log_warn "Unexpected ZAP release tag format: $tag"
+        return 1
+    fi
+
     version="${tag#v}"
     zap_dir="$install_dir/ZAP_${version}"
 
-    # Check if already extracted
+    # Check if this specific version is already extracted
     if [[ -d "$zap_dir" ]]; then
         local existing_jar
         existing_jar=$(find "$zap_dir" -maxdepth 1 \( -name "zap-*.jar" -o -name "ZAP_*.jar" \) 2>/dev/null | head -1)
@@ -325,6 +365,10 @@ install_zap_jar() {
             ZAP_JAR="$existing_jar"
             ZAP_HOME="$zap_dir"
             return 0
+        else
+            # Broken extraction — clean up and re-download
+            log_detail "Incomplete ZAP install at $zap_dir, removing..."
+            rm -rf "$zap_dir"
         fi
     fi
 
@@ -824,7 +868,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
 fi
 
 # Docker: soft-check (informational)
-if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+if command -v docker &>/dev/null && timeout 10 docker info &>/dev/null 2>&1; then
     DOCKER_AVAILABLE=true
     log_detail "Docker: available"
 else
@@ -843,6 +887,16 @@ elif [[ -n "${JAVA_HOME:-}" ]] && [[ -x "$JAVA_HOME/bin/java" ]]; then
     log_detail "Java: available via JAVA_HOME ($JAVA_HOME)"
 else
     log_detail "Java: not available"
+fi
+
+# Validate Java version >= 11 (required by ZAP)
+if [[ "$JAVA_AVAILABLE" == "true" ]]; then
+    JAVA_VER=$("$JAVA_CMD" -version 2>&1 | head -1 | sed -E 's/.*"([0-9]+)(\.[0-9]+)*.*/\1/')
+    if [[ -n "$JAVA_VER" ]] && [[ "$JAVA_VER" -lt 11 ]] 2>/dev/null; then
+        log_warn "Java $JAVA_VER detected but ZAP requires Java >= 11. Local ZAP disabled."
+        JAVA_AVAILABLE=false
+        JAVA_CMD=""
+    fi
 fi
 
 log_ok "Prerequisites OK (curl, jq)"
@@ -1595,7 +1649,7 @@ else
 fi
 
 # ============================================================
-# STEP 6: Start OWASP ZAP
+# STEP 6: Start OWASP ZAP (local or Docker)
 # ============================================================
 log_step "STEP 6: Starting OWASP ZAP ($ZAP_MODE mode) on port $ZAP_API_PORT..."
 
@@ -1612,14 +1666,31 @@ ZAP_TARGET_HOST="localhost"
 if [[ "$ZAP_MODE" == "local" ]]; then
     # ---- Local ZAP (Java process) ----
     log_detail "Starting local ZAP: $ZAP_JAR"
-    $JAVA_CMD -Xmx512m -jar "$ZAP_JAR" \
+
+    # Scale heap: 1g for full scan, 512m for baseline
+    local zap_heap="512m"
+    if [[ "$FULL_SCAN" == "true" ]]; then
+        zap_heap="1g"
+    fi
+
+    local zap_log="${TMPDIR:-/tmp}/auto-zap-daemon-$$.log"
+    "$JAVA_CMD" -Xms256m -Xmx"$zap_heap" -jar "$ZAP_JAR" \
         -daemon -port "$ZAP_API_PORT" \
         -config api.key="$ZAP_API_KEY" \
         -config api.addrs.addr.name=.* \
         -config api.addrs.addr.regex=true \
-        -config connection.timeoutInSecs=120 &
+        -config connection.timeoutInSecs=120 \
+        >"$zap_log" 2>&1 &
     ZAP_PID=$!
-    log_detail "ZAP started (PID $ZAP_PID)"
+    log_detail "ZAP started (PID $ZAP_PID, log: $zap_log)"
+
+    # Early-death detection: wait 3s then check if process is still alive
+    sleep 3
+    if ! kill -0 "$ZAP_PID" 2>/dev/null; then
+        log_err "ZAP process died within 3 seconds. Check log: $zap_log"
+        tail -20 "$zap_log" 2>/dev/null | while IFS= read -r line; do log_detail "  $line"; done
+        exit 1
+    fi
 else
     # ---- Docker ZAP ----
     # Remove any existing container

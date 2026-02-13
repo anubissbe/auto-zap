@@ -67,6 +67,10 @@ inputs:
     description: 'Show what would happen without executing any scan'
     required: false
     default: 'false'
+  use-docker-zap:
+    description: 'Force ZAP to run in Docker mode instead of local Java'
+    required: false
+    default: 'false'
   working-directory:
     description: 'Working directory for the scan (default: repository root)'
     required: false
@@ -123,6 +127,7 @@ runs:
         if [[ -n "${{ inputs.scan-mode }}" && "${{ inputs.scan-mode }}" != "auto" ]]; then ARGS+=(--scan-mode "${{ inputs.scan-mode }}"); fi
         if [[ "${{ inputs.verbose }}" == "true" ]]; then ARGS+=(--verbose); fi
         if [[ "${{ inputs.dry-run }}" == "true" ]]; then ARGS+=(--dry-run); fi
+        if [[ "${{ inputs.use-docker-zap }}" == "true" ]]; then ARGS+=(--use-docker-zap); fi
 
         "${{ github.action_path }}/auto-zap.sh" "${ARGS[@]}" || EXIT_CODE=$?
 

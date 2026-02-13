@@ -199,18 +199,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Cache ZAP install
+        id: zap-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.auto-zap/zap
+          key: zap-crossplatform-${{ runner.os }}
+
       - name: Install ZAP for local mode
+        if: steps.zap-cache.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p $HOME/.auto-zap/zap
-          RELEASE=$(curl -sf https://api.github.com/repos/zaproxy/zaproxy/releases/latest)
-          TAG=$(echo "$RELEASE" | jq -r '.tag_name')
-          VERSION=${TAG#v}
+          mkdir -p "$HOME/.auto-zap/zap"
+          RELEASE=$(curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/zaproxy/zaproxy/releases/latest) || RELEASE=""
+          TAG=$(echo "$RELEASE" | jq -r '.tag_name // empty' 2>/dev/null)
+          # Fallback if API call fails or returns unexpected result
+          if [[ -z "$TAG" || ! "$TAG" =~ ^v?[0-9]+\.[0-9]+ ]]; then
+            echo "::warning::GitHub API returned invalid tag '$TAG', using fallback"
+            TAG="v2.16.1"
+          fi
+          VERSION="${TAG#v}"
           curl -fSL -o "$HOME/.auto-zap/zap/ZAP_${VERSION}_Crossplatform.zip" \
             "https://github.com/zaproxy/zaproxy/releases/download/${TAG}/ZAP_${VERSION}_Crossplatform.zip"
           unzip -qo "$HOME/.auto-zap/zap/ZAP_${VERSION}_Crossplatform.zip" -d "$HOME/.auto-zap/zap/"
           rm -f "$HOME/.auto-zap/zap/ZAP_${VERSION}_Crossplatform.zip"
           ls -lh "$HOME/.auto-zap/zap/ZAP_${VERSION}/"
-          java -version
+
+      - name: Verify Java
+        run: java -version
 
       - name: Create test app
         run: |
