@@ -612,7 +612,10 @@ function Cleanup {
     Write-Ok "Cleanup complete."
 }
 
-trap { Cleanup; break }
+trap {
+    try { Cleanup } catch { Write-Warn "Cleanup error: $($_.Exception.Message)" }
+    break
+}
 
 function Test-Command([string]$Name) {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
@@ -3230,8 +3233,10 @@ function Provision-TempUser {
     if ($hint -eq "laravel" -or (Test-Path (Join-Path $ProjectDir "artisan"))) {
         Write-Detail "Attempting Laravel user creation via artisan tinker..."
         $artisan = Join-Path $ProjectDir "artisan"
-        $tinkerCode = '\App\Models\User::create([''name''=>''__USER__'',''email''=>''__EMAIL__'',''password''=>bcrypt(''__PASS__'')]); echo ''OK'';'
-        $tinkerCode = $tinkerCode.Replace('__USER__', $tempUser).Replace('__EMAIL__', $tempEmail).Replace('__PASS__', $tempPass)
+        $env:AUTO_ZAP_USER = $tempUser
+        $env:AUTO_ZAP_EMAIL = $tempEmail
+        $env:AUTO_ZAP_PASS = $tempPass
+        $tinkerCode = '\App\Models\User::create(["name"=>env("AUTO_ZAP_USER"),"email"=>env("AUTO_ZAP_EMAIL"),"password"=>bcrypt(env("AUTO_ZAP_PASS"))]); echo "OK";'
         try {
             $executeArg = "--execute=$tinkerCode"
             $output = & php $artisan tinker $executeArg 2>&1
@@ -3253,6 +3258,9 @@ function Provision-TempUser {
         } catch {
             Write-Detail "Laravel tinker error: $($_.Exception.Message)"
         }
+        Remove-Item Env:\AUTO_ZAP_USER -ErrorAction SilentlyContinue
+        Remove-Item Env:\AUTO_ZAP_EMAIL -ErrorAction SilentlyContinue
+        Remove-Item Env:\AUTO_ZAP_PASS -ErrorAction SilentlyContinue
         if ($result.Success) { return $result }
     }
 
@@ -3285,7 +3293,9 @@ function Provision-TempUser {
         $gemText = Get-Content (Join-Path $ProjectDir "Gemfile") -Raw -ErrorAction SilentlyContinue
         if ($gemText -and $gemText -match "devise") {
             Write-Detail "Attempting Rails/Devise user creation..."
-            $rubyCode = "User.create!(email: '$tempEmail', password: '$tempPass', password_confirmation: '$tempPass')"
+            $env:AUTO_ZAP_EMAIL = $tempEmail
+            $env:AUTO_ZAP_PASS = $tempPass
+            $rubyCode = 'User.create!(email: ENV["AUTO_ZAP_EMAIL"], password: ENV["AUTO_ZAP_PASS"], password_confirmation: ENV["AUTO_ZAP_PASS"])'
             try {
                 Push-Location $ProjectDir
                 $output = & bundle exec rails runner "$rubyCode" 2>&1
@@ -3312,6 +3322,8 @@ function Provision-TempUser {
                 Write-Detail "Rails runner error: $($_.Exception.Message)"
                 Pop-Location -ErrorAction SilentlyContinue
             }
+            Remove-Item Env:\AUTO_ZAP_EMAIL -ErrorAction SilentlyContinue
+            Remove-Item Env:\AUTO_ZAP_PASS -ErrorAction SilentlyContinue
             if ($result.Success) { return $result }
         }
     }
@@ -3440,7 +3452,8 @@ function Remove-TempUser {
             try {
                 $managePy = Join-Path $CleanupInfo.ProjectDir "manage.py"
                 $pyCmd = $CleanupInfo.PyCmd
-                $deleteCode = "from django.contrib.auth.models import User; User.objects.filter(username='$($CleanupInfo.Username)').delete(); print('deleted')"
+                $env:AUTO_ZAP_DEL_USER = $CleanupInfo.Username
+                $deleteCode = "import os; from django.contrib.auth.models import User; User.objects.filter(username=os.environ['AUTO_ZAP_DEL_USER']).delete(); print('deleted')"
                 $output = & $pyCmd $managePy shell -c "$deleteCode" 2>&1
                 if ($output -match "deleted") {
                     Write-Ok "Django temp user removed."
@@ -3450,12 +3463,13 @@ function Remove-TempUser {
             } catch {
                 Write-Warn "Failed to remove Django temp user: $($_.Exception.Message)"
             }
+            Remove-Item Env:\AUTO_ZAP_DEL_USER -ErrorAction SilentlyContinue
         }
         "laravel" {
             try {
                 $artisan = Join-Path $CleanupInfo.ProjectDir "artisan"
-                $deleteCode = '\App\Models\User::where(''email'',''__EMAIL__'')->delete(); echo ''deleted'';'
-                $deleteCode = $deleteCode.Replace('__EMAIL__', $CleanupInfo.Email)
+                $env:AUTO_ZAP_DEL_EMAIL = $CleanupInfo.Email
+                $deleteCode = '\App\Models\User::where("email",env("AUTO_ZAP_DEL_EMAIL"))->delete(); echo "deleted";'
                 $output = & php $artisan tinker ("--execute=" + $deleteCode) 2>&1
                 if ($output -match "deleted") {
                     Write-Ok "Laravel temp user removed."
@@ -3465,6 +3479,7 @@ function Remove-TempUser {
             } catch {
                 Write-Warn "Failed to remove Laravel temp user: $($_.Exception.Message)"
             }
+            Remove-Item Env:\AUTO_ZAP_DEL_EMAIL -ErrorAction SilentlyContinue
         }
         "wordpress" {
             try {
@@ -3477,7 +3492,8 @@ function Remove-TempUser {
         "rails" {
             try {
                 Push-Location $CleanupInfo.ProjectDir
-                $rubyCode = "u = User.find_by(email: '$($CleanupInfo.Email)'); u.destroy! if u"
+                $env:AUTO_ZAP_DEL_EMAIL = $CleanupInfo.Email
+                $rubyCode = 'u = User.find_by(email: ENV["AUTO_ZAP_DEL_EMAIL"]); u.destroy! if u'
                 & bundle exec rails runner "$rubyCode" 2>&1 | Out-Null
                 Pop-Location
                 Write-Ok "Rails temp user removed."
@@ -3485,6 +3501,7 @@ function Remove-TempUser {
                 Write-Warn "Failed to remove Rails temp user: $($_.Exception.Message)"
                 Pop-Location -ErrorAction SilentlyContinue
             }
+            Remove-Item Env:\AUTO_ZAP_DEL_EMAIL -ErrorAction SilentlyContinue
         }
         "api" {
             # Best-effort: try DELETE endpoints if we have a token

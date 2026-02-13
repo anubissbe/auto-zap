@@ -39,3 +39,6 @@ test-apps/results/*.txt
 test-apps/**/node_modules/
 test-apps/**/.venv/
 test-apps/**/db.sqlite3
+
+# Research documents (not part of release)
+research-*.md

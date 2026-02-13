@@ -24,10 +24,15 @@ param(
     [switch]$SkipDownload,
     [switch]$SkipSign,
     [string]$CertPath,
-    [string]$CertPassword = "AutoZap2026!"
+    [string]$CertPassword = $env:CERT_PASSWORD
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $SkipSign -and -not $CertPassword) {
+    $CertPassword = "AutoZap2026!"
+    Write-Host "[!] No CERT_PASSWORD env var set - using default (dev only)." -ForegroundColor Yellow
+}
 $buildDir = $PSScriptRoot
 $projectDir = Split-Path $buildDir -Parent
 $stagingDir = Join-Path $buildDir "staging"

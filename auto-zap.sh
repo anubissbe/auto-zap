@@ -7,7 +7,7 @@ set -euo pipefail
 
 # ---- Configuration ----
 ZAP_API_PORT=8090
-ZAP_API_KEY=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' || uuidgen 2>/dev/null | tr -d '-' || echo "auto-zap-$(date +%s)")
+ZAP_API_KEY=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' || uuidgen 2>/dev/null | tr -d '-' || openssl rand -hex 16 2>/dev/null || { echo "FATAL: No cryptographic random source for ZAP API key" >&2; exit 1; })
 ZAP_DOCKER_IMAGE="ghcr.io/zaproxy/zaproxy:stable"
 ZAP_CONTAINER_NAME="auto-zap-$$"
 ORIGINAL_DIR=$(pwd)
@@ -28,6 +28,10 @@ AUTH_TOKEN=""
 AUTH_TYPE=""
 AUTO_AUTH=false
 SARIF=false
+USE_DOCKER_ZAP=true  # Bash version always uses Docker ZAP
+DRY_RUN=false
+VERBOSE_LOG=false
+SCAN_MODE="auto"
 
 # ---- State ----
 APP_PID=""
@@ -60,6 +64,8 @@ log_ok()     { echo -e "${GREEN}[+] $1${NC}"; }
 log_warn()   { echo -e "${YELLOW}[!] $1${NC}"; }
 log_err()    { echo -e "${RED}[-] $1${NC}"; }
 log_detail() { echo -e "${GRAY}    $1${NC}"; }
+log_verbose() { [[ "$VERBOSE_LOG" == "true" ]] && echo -e "${GRAY}[V] $1${NC}" || true; }
+log_dryrun()  { [[ "$DRY_RUN" == "true" ]] && echo -e "\033[0;35m[DRY-RUN] $1${NC}" || true; }
 
 # ---- Parse arguments ----
 while [[ $# -gt 0 ]]; do
@@ -78,6 +84,10 @@ while [[ $# -gt 0 ]]; do
         --auth-type)        AUTH_TYPE="$2"; shift 2 ;;
         --auto-auth|-a)     AUTO_AUTH=true; shift ;;
         --sarif)            SARIF=true; shift ;;
+        --use-docker-zap)   USE_DOCKER_ZAP=true; shift ;;
+        --dry-run)          DRY_RUN=true; shift ;;
+        --verbose|-v)       VERBOSE_LOG=true; shift ;;
+        --scan-mode)        SCAN_MODE="$2"; shift 2 ;;
         --help|-h)
             echo "Usage: auto-zap.sh [options]"
             echo ""
@@ -95,6 +105,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --auth-type TYPE       form, json, or bearer"
             echo "  --auto-auth, -a        Auto-create temp user for authenticated scanning"
             echo "  --sarif                Generate SARIF report for GitHub Code Scanning"
+            echo "  --use-docker-zap       Use Docker-based ZAP (default, always enabled on Linux)"
+            echo "  --dry-run              Show what would happen without executing"
+            echo "  --verbose, -v          Enable verbose debug logging"
+            echo "  --scan-mode MODE       Scan mode: auto, webapp, api, static"
             echo "  --help, -h             Show this help"
             exit 0
             ;;
@@ -225,7 +239,8 @@ random_string() {
     local length="${1:-8}"
     cat /dev/urandom 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c "$length" 2>/dev/null \
         || python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range($length)))" 2>/dev/null \
-        || echo "$(date +%s)$$"
+        || openssl rand -hex $(( (length + 1) / 2 )) 2>/dev/null | head -c "$length" \
+        || { echo "FATAL: No cryptographic random source available" >&2; return 1; }
 }
 
 # ---- Auto-Auth: Detect if app requires authentication ----
@@ -402,6 +417,10 @@ provision_temp_user() {
     AUTO_AUTH_PASS="ZapTest-${rand}!1"
     AUTO_AUTH_CREATED=false
     AUTO_AUTH_CLEANUP_CMD=""
+    AUTO_AUTH_CLEANUP_METHOD=""
+    AUTO_AUTH_CLEANUP_DIR=""
+    AUTO_AUTH_CLEANUP_ID=""
+    AUTO_AUTH_CLEANUP_EXTRA=""
     AUTO_AUTH_LOGIN_URL=""
     AUTO_AUTH_LOGIN_TYPE="$AUTH_SUGGESTED_TYPE"
 
@@ -420,7 +439,10 @@ provision_temp_user() {
            $py_cmd "$project_dir/manage.py" createsuperuser --noinput 2>&1; then
             log_ok "Django superuser created: $AUTO_AUTH_USER"
             AUTO_AUTH_CREATED=true
-            AUTO_AUTH_CLEANUP_CMD="django:$project_dir:$AUTO_AUTH_USER:$py_cmd"
+            AUTO_AUTH_CLEANUP_METHOD="django"
+            AUTO_AUTH_CLEANUP_DIR="$project_dir"
+            AUTO_AUTH_CLEANUP_ID="$AUTO_AUTH_USER"
+            AUTO_AUTH_CLEANUP_EXTRA="$py_cmd"
             # Find best login URL
             for ep in "${AUTH_LOGIN_ENDPOINTS[@]}"; do
                 [[ "$ep" == "/admin/login/" ]] && AUTO_AUTH_LOGIN_URL="${target_url}/admin/login/" && AUTO_AUTH_LOGIN_TYPE="form" && break
@@ -433,16 +455,22 @@ provision_temp_user() {
     # Laravel
     if [[ "$AUTH_HINT" == "laravel" || -f "$project_dir/artisan" ]]; then
         log_detail "Attempting Laravel user creation via artisan tinker..."
-        local tinker_code="\\App\\Models\\User::create(['name'=>'$AUTO_AUTH_USER','email'=>'$AUTO_AUTH_EMAIL','password'=>bcrypt('$AUTO_AUTH_PASS')]); echo 'OK';"
+        export AUTO_ZAP_USER="$AUTO_AUTH_USER"
+        export AUTO_ZAP_EMAIL="$AUTO_AUTH_EMAIL"
+        export AUTO_ZAP_PASS="$AUTO_AUTH_PASS"
+        local tinker_code='\\App\\Models\\User::create(["name"=>env("AUTO_ZAP_USER"),"email"=>env("AUTO_ZAP_EMAIL"),"password"=>bcrypt(env("AUTO_ZAP_PASS"))]); echo "OK";'
         local output
         output=$(php "$project_dir/artisan" tinker --execute="$tinker_code" 2>&1) || true
         if echo "$output" | grep -q "OK"; then
             log_ok "Laravel user created: $AUTO_AUTH_USER"
             AUTO_AUTH_CREATED=true
             AUTO_AUTH_USER="$AUTO_AUTH_EMAIL"  # Laravel uses email for login
-            AUTO_AUTH_CLEANUP_CMD="laravel:$project_dir:$AUTO_AUTH_EMAIL"
+            AUTO_AUTH_CLEANUP_METHOD="laravel"
+            AUTO_AUTH_CLEANUP_DIR="$project_dir"
+            AUTO_AUTH_CLEANUP_ID="$AUTO_AUTH_EMAIL"
             [[ ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
         fi
+        unset AUTO_ZAP_USER AUTO_ZAP_EMAIL AUTO_ZAP_PASS
         [[ "$AUTO_AUTH_CREATED" == "true" ]] && return 0
     fi
 
@@ -452,7 +480,9 @@ provision_temp_user() {
         if wp user create "$AUTO_AUTH_USER" "$AUTO_AUTH_EMAIL" --user_pass="$AUTO_AUTH_PASS" --role=administrator --path="$project_dir" 2>&1; then
             log_ok "WordPress user created: $AUTO_AUTH_USER"
             AUTO_AUTH_CREATED=true
-            AUTO_AUTH_CLEANUP_CMD="wordpress:$project_dir:$AUTO_AUTH_USER"
+            AUTO_AUTH_CLEANUP_METHOD="wordpress"
+            AUTO_AUTH_CLEANUP_DIR="$project_dir"
+            AUTO_AUTH_CLEANUP_ID="$AUTO_AUTH_USER"
             AUTO_AUTH_LOGIN_URL="${target_url}/wp-login.php"
             AUTO_AUTH_LOGIN_TYPE="form"
         fi
@@ -462,17 +492,22 @@ provision_temp_user() {
     # Rails/Devise
     if [[ "$AUTH_HINT" == "rails-devise" ]]; then
         log_detail "Attempting Rails/Devise user creation..."
-        local ruby_code="User.create!(email: '$AUTO_AUTH_EMAIL', password: '$AUTO_AUTH_PASS', password_confirmation: '$AUTO_AUTH_PASS')"
+        export AUTO_ZAP_EMAIL="$AUTO_AUTH_EMAIL"
+        export AUTO_ZAP_PASS="$AUTO_AUTH_PASS"
+        local ruby_code='User.create!(email: ENV["AUTO_ZAP_EMAIL"], password: ENV["AUTO_ZAP_PASS"], password_confirmation: ENV["AUTO_ZAP_PASS"])'
         if (cd "$project_dir" && bundle exec rails runner "$ruby_code" 2>&1); then
             log_ok "Rails/Devise user created: $AUTO_AUTH_EMAIL"
             AUTO_AUTH_CREATED=true
             AUTO_AUTH_USER="$AUTO_AUTH_EMAIL"
-            AUTO_AUTH_CLEANUP_CMD="rails:$project_dir:$AUTO_AUTH_EMAIL"
+            AUTO_AUTH_CLEANUP_METHOD="rails"
+            AUTO_AUTH_CLEANUP_DIR="$project_dir"
+            AUTO_AUTH_CLEANUP_ID="$AUTO_AUTH_EMAIL"
             for ep in "${AUTH_LOGIN_ENDPOINTS[@]}"; do
                 [[ "$ep" == "/users/sign_in" ]] && AUTO_AUTH_LOGIN_URL="${target_url}/users/sign_in" && AUTO_AUTH_LOGIN_TYPE="form" && break
             done
             [[ -z "$AUTO_AUTH_LOGIN_URL" && ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
         fi
+        unset AUTO_ZAP_EMAIL AUTO_ZAP_PASS
         [[ "$AUTO_AUTH_CREATED" == "true" ]] && return 0
     fi
 
@@ -513,12 +548,14 @@ provision_temp_user() {
                     log_ok "User registered via $ep (HTTP $http_code)"
                     AUTO_AUTH_CREATED=true
                     AUTO_AUTH_LOGIN_TYPE="json"
-                    AUTO_AUTH_CLEANUP_CMD="api:$target_url:$AUTO_AUTH_USER"
+                    AUTO_AUTH_CLEANUP_METHOD="api"
+                    AUTO_AUTH_CLEANUP_DIR="$target_url"
+                    AUTO_AUTH_CLEANUP_ID="$AUTO_AUTH_USER"
 
                     # Try to extract token for later cleanup
                     local token
                     token=$(echo "$body" | jq -r '.token // .access_token // .accessToken // empty' 2>/dev/null || echo "")
-                    [[ -n "$token" ]] && AUTO_AUTH_CLEANUP_CMD="api:$target_url:$AUTO_AUTH_USER:$token"
+                    [[ -n "$token" ]] && AUTO_AUTH_CLEANUP_EXTRA="$token"
 
                     [[ ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
                     return 0
@@ -538,7 +575,9 @@ provision_temp_user() {
                 AUTO_AUTH_CREATED=true
                 AUTO_AUTH_USER="$AUTO_AUTH_EMAIL"
                 AUTO_AUTH_LOGIN_TYPE="form"
-                AUTO_AUTH_CLEANUP_CMD="api:$target_url:$AUTO_AUTH_EMAIL"
+                AUTO_AUTH_CLEANUP_METHOD="api"
+                AUTO_AUTH_CLEANUP_DIR="$target_url"
+                AUTO_AUTH_CLEANUP_ID="$AUTO_AUTH_EMAIL"
                 [[ ${#AUTH_LOGIN_ENDPOINTS[@]} -gt 0 ]] && AUTO_AUTH_LOGIN_URL="${target_url}${AUTH_LOGIN_ENDPOINTS[0]}"
                 return 0
             fi
@@ -552,18 +591,21 @@ provision_temp_user() {
 
 # ---- Auto-Auth: Remove temporary test user ----
 remove_temp_user() {
-    if [[ "$AUTO_AUTH_CREATED" != "true" || -z "$AUTO_AUTH_CLEANUP_CMD" ]]; then return; fi
+    if [[ "$AUTO_AUTH_CREATED" != "true" || -z "$AUTO_AUTH_CLEANUP_METHOD" ]]; then return; fi
 
     log_step "Removing temporary test user..."
 
-    local method project_dir identifier extra
-    IFS=':' read -r method project_dir identifier extra <<< "$AUTO_AUTH_CLEANUP_CMD"
+    local method="$AUTO_AUTH_CLEANUP_METHOD"
+    local project_dir="$AUTO_AUTH_CLEANUP_DIR"
+    local identifier="$AUTO_AUTH_CLEANUP_ID"
+    local extra="$AUTO_AUTH_CLEANUP_EXTRA"
 
     case "$method" in
         django)
             local py_cmd="$extra"
             [[ -z "$py_cmd" ]] && py_cmd="python3"
-            local del_code="from django.contrib.auth.models import User; User.objects.filter(username='$identifier').delete(); print('deleted')"
+            export AUTO_ZAP_DEL_USER="$identifier"
+            local del_code="import os; from django.contrib.auth.models import User; User.objects.filter(username=os.environ['AUTO_ZAP_DEL_USER']).delete(); print('deleted')"
             local output
             output=$($py_cmd "$project_dir/manage.py" shell -c "$del_code" 2>&1) || true
             if echo "$output" | grep -q "deleted"; then
@@ -571,9 +613,11 @@ remove_temp_user() {
             else
                 log_warn "Django user cleanup may have failed."
             fi
+            unset AUTO_ZAP_DEL_USER
             ;;
         laravel)
-            local del_code="\\App\\Models\\User::where('email','$identifier')->delete(); echo 'deleted';"
+            export AUTO_ZAP_DEL_EMAIL="$identifier"
+            local del_code='\\App\\Models\\User::where("email",env("AUTO_ZAP_DEL_EMAIL"))->delete(); echo "deleted";'
             local output
             output=$(php "$project_dir/artisan" tinker --execute="$del_code" 2>&1) || true
             if echo "$output" | grep -q "deleted"; then
@@ -581,13 +625,14 @@ remove_temp_user() {
             else
                 log_warn "Laravel user cleanup may have failed."
             fi
+            unset AUTO_ZAP_DEL_EMAIL
             ;;
         wordpress)
             wp user delete "$identifier" --yes --path="$project_dir" 2>&1 || log_warn "WordPress user cleanup may have failed."
             log_ok "WordPress temp user removed."
             ;;
         rails)
-            (cd "$project_dir" && bundle exec rails runner "User.find_by(email: '$identifier')&.destroy!" 2>&1) || log_warn "Rails user cleanup may have failed."
+            (cd "$project_dir" && AUTO_ZAP_DEL_EMAIL="$identifier" bundle exec rails runner 'User.find_by(email: ENV["AUTO_ZAP_DEL_EMAIL"])&.destroy!' 2>&1) || log_warn "Rails user cleanup may have failed."
             log_ok "Rails temp user removed."
             ;;
         api)
@@ -708,6 +753,13 @@ load_config_file() {
     fi
 }
 load_config_file
+
+# ---- Validate scan mode ----
+case "$SCAN_MODE" in
+    auto|webapp|api|static) ;;
+    *) log_err "Invalid --scan-mode: $SCAN_MODE (must be: auto, webapp, api, static)"; exit 1 ;;
+esac
+log_verbose "ScanMode: $SCAN_MODE | DryRun: $DRY_RUN | VerboseLog: $VERBOSE_LOG"
 
 # ============================================================
 # STEP 1: Detect framework (or use provided URL)
@@ -1271,6 +1323,31 @@ else
         exit 1
     fi
     echo ""
+fi
+
+# ---- Dry-run exit point ----
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo ""
+    log_dryrun "=== DRY RUN SUMMARY ==="
+    log_dryrun "Framework       : ${FRAMEWORK:-None}"
+    log_dryrun "Runtime         : ${RUNTIME:-None}"
+    log_dryrun "Scan mode       : $SCAN_MODE"
+    log_dryrun "Start command   : ${START_COMMAND:-N/A}"
+    log_dryrun "Target URL      : ${URL:-http://localhost:$APP_PORT}"
+    log_dryrun "ZAP mode        : Docker"
+    log_dryrun "Auth            : $(if [[ -n "$AUTH_USER" || -n "$AUTH_TOKEN" ]]; then echo 'Yes'; elif [[ "$AUTO_AUTH" == "true" ]]; then echo 'Auto'; else echo 'None'; fi)"
+    log_dryrun "Full scan       : $FULL_SCAN"
+    log_dryrun ""
+    log_dryrun "Would execute:"
+    log_dryrun "  1. Start app: ${START_COMMAND:-N/A}"
+    log_dryrun "  2. Start ZAP on port $ZAP_API_PORT"
+    log_dryrun "  3. Configure context + technology filter"
+    log_dryrun "  4. Import API specs (if found)"
+    log_dryrun "  5. Run spider + active vulnerability scan"
+    log_dryrun "  6. Generate reports"
+    log_dryrun "  7. Cleanup all processes"
+    log_ok "Dry run complete. No scanning performed."
+    exit 0
 fi
 
 # ============================================================
