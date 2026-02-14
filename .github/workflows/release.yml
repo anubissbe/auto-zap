@@ -5,8 +5,7 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   # ============================================================
@@ -25,21 +24,34 @@ jobs:
     name: Build Installer
     runs-on: windows-latest
     needs: ci
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install NSIS
-        run: choco install nsis -y
+        run: choco install nsis -y --version=3.10
 
       - name: Download OWASP ZAP
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $zapUrl = "https://github.com/zaproxy/zaproxy/releases/download/v2.16.1/ZAP_2.16.1_Core.zip"
+          $expectedHash = "e757f26d972847e6a1a89ed95a1f03ac310922ff7e8a7843ae164fcaa5d5ae06"
           $zapZip = "build/staging/zap.zip"
           New-Item -ItemType Directory -Path "build/staging" -Force | Out-Null
           Write-Host "Downloading ZAP from $zapUrl ..."
           Invoke-WebRequest -Uri $zapUrl -OutFile $zapZip -UseBasicParsing
+
+          # Verify checksum
+          $actualHash = (Get-FileHash -Path $zapZip -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) {
+            Write-Error "ZAP checksum mismatch! Expected: $expectedHash, Got: $actualHash"
+            exit 1
+          }
+          Write-Host "ZAP checksum verified: $actualHash"
+
           Write-Host "Extracting ZAP..."
           Expand-Archive -Path $zapZip -DestinationPath "build/staging/zap-extract" -Force
           # Move contents to build/staging/zap (flatten one level if needed)
@@ -56,11 +68,22 @@ jobs:
       - name: Download Eclipse Temurin JRE 17
         shell: pwsh
         run: |
-          $jreUrl = "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jre/hotspot/normal/eclipse?project=jdk"
+          $ErrorActionPreference = "Stop"
+          $jreUrl = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.18%2B8/OpenJDK17U-jre_x64_windows_hotspot_17.0.18_8.zip"
+          $expectedHash = "95c9ebe3ee16baab7239531757513d9a03799ca06483ef2f3b530e81e93e7b5b"
           $jreZip = "build/staging/jre.zip"
           New-Item -ItemType Directory -Path "build/staging" -Force | Out-Null
-          Write-Host "Downloading Temurin JRE 17..."
+          Write-Host "Downloading Temurin JRE 17.0.18+8..."
           Invoke-WebRequest -Uri $jreUrl -OutFile $jreZip -UseBasicParsing
+
+          # Verify checksum
+          $actualHash = (Get-FileHash -Path $jreZip -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) {
+            Write-Error "JRE checksum mismatch! Expected: $expectedHash, Got: $actualHash"
+            exit 1
+          }
+          Write-Host "JRE checksum verified: $actualHash"
+
           Write-Host "Extracting JRE..."
           Expand-Archive -Path $jreZip -DestinationPath "build/staging/jre-extract" -Force
           # Move contents to build/staging/jre (flatten one level if needed)
@@ -92,11 +115,50 @@ jobs:
           $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "Installer built: $exe ($size MB)"
 
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v6
+      - name: Create portable ZIP bundle
+        shell: pwsh
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:VERSION
+
+          # Validate version format
+          if ($version -notmatch '^v\d+\.\d+\.\d+') {
+            Write-Error "Invalid version tag format: $version"
+            exit 1
+          }
+
+          # Validate staging directories have content
+          $zapFiles = (Get-ChildItem "build/staging/zap" -Recurse -File).Count
+          $jreFiles = (Get-ChildItem "build/staging/jre" -Recurse -File).Count
+          if ($zapFiles -eq 0) { Write-Error "ZAP staging directory is empty"; exit 1 }
+          if ($jreFiles -eq 0) { Write-Error "JRE staging directory is empty"; exit 1 }
+
+          $bundleDir = "dist/Auto-ZAP-portable"
+          New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
+
+          # Copy scripts
+          Copy-Item auto-zap.ps1, auto-zap.sh, action.yml, README.md, LICENSE $bundleDir
+          Copy-Item build/auto-zap.cmd, build/Invoke-AutoZap.ps1 $bundleDir
+
+          # Copy ZAP + JRE from existing staging (already downloaded)
+          Copy-Item -Path "build/staging/zap" -Destination "$bundleDir/zap" -Recurse
+          Copy-Item -Path "build/staging/jre" -Destination "$bundleDir/jre" -Recurse
+
+          # Create ZIP
+          Compress-Archive -Path $bundleDir -DestinationPath "dist/Auto-ZAP-${version}-portable.zip"
+          $size = [math]::Round((Get-Item "dist/Auto-ZAP-${version}-portable.zip").Length / 1MB, 1)
+          Write-Host "Portable bundle: Auto-ZAP-${version}-portable.zip ($size MB)"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: installer
-          path: dist/Auto-ZAP-Setup.exe
+          path: |
+            dist/Auto-ZAP-Setup.exe
+            dist/Auto-ZAP-*-portable.zip
           retention-days: 1
 
   # ============================================================
@@ -106,22 +168,26 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download installer artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: installer
           path: dist/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             dist/Auto-ZAP-Setup.exe
+            dist/Auto-ZAP-*-portable.zip
             auto-zap.ps1
             auto-zap.sh
             action.yml
