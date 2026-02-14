@@ -110,26 +110,44 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_PORT: ${{ inputs.port }}
+        INPUT_REPORT_PATH: ${{ inputs.report-path }}
+        INPUT_FULL_SCAN: ${{ inputs.full-scan }}
+        INPUT_KEEP_DOCKER: ${{ inputs.keep-docker }}
+        INPUT_SKIP_INSTALL: ${{ inputs.skip-install }}
+        INPUT_AUTH_USER: ${{ inputs.auth-user }}
+        INPUT_AUTH_PASSWORD: ${{ inputs.auth-password }}
+        INPUT_AUTH_URL: ${{ inputs.auth-url }}
+        INPUT_AUTH_TOKEN: ${{ inputs.auth-token }}
+        INPUT_AUTH_TYPE: ${{ inputs.auth-type }}
+        INPUT_AUTO_AUTH: ${{ inputs.auto-auth }}
+        INPUT_SCAN_MODE: ${{ inputs.scan-mode }}
+        INPUT_VERBOSE: ${{ inputs.verbose }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_USE_DOCKER_ZAP: ${{ inputs.use-docker-zap }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         ARGS=()
-        if [[ -n "${{ inputs.url }}" ]]; then ARGS+=(--url "${{ inputs.url }}"); fi
-        if [[ -n "${{ inputs.port }}" ]]; then ARGS+=(--port "${{ inputs.port }}"); fi
-        if [[ -n "${{ inputs.report-path }}" ]]; then ARGS+=(--report-path "${{ inputs.report-path }}"); fi
-        if [[ "${{ inputs.full-scan }}" == "true" ]]; then ARGS+=(--full-scan); fi
-        if [[ "${{ inputs.keep-docker }}" == "true" ]]; then ARGS+=(--keep-docker); fi
-        if [[ "${{ inputs.skip-install }}" == "true" ]]; then ARGS+=(--skip-install); fi
-        if [[ -n "${{ inputs.auth-user }}" ]]; then ARGS+=(--auth-user "${{ inputs.auth-user }}"); fi
-        if [[ -n "${{ inputs.auth-password }}" ]]; then ARGS+=(--auth-password "${{ inputs.auth-password }}"); fi
-        if [[ -n "${{ inputs.auth-url }}" ]]; then ARGS+=(--auth-url "${{ inputs.auth-url }}"); fi
-        if [[ -n "${{ inputs.auth-token }}" ]]; then ARGS+=(--auth-token "${{ inputs.auth-token }}"); fi
-        if [[ -n "${{ inputs.auth-type }}" ]]; then ARGS+=(--auth-type "${{ inputs.auth-type }}"); fi
-        if [[ "${{ inputs.auto-auth }}" == "true" ]]; then ARGS+=(--auto-auth); fi
-        if [[ -n "${{ inputs.scan-mode }}" && "${{ inputs.scan-mode }}" != "auto" ]]; then ARGS+=(--scan-mode "${{ inputs.scan-mode }}"); fi
-        if [[ "${{ inputs.verbose }}" == "true" ]]; then ARGS+=(--verbose); fi
-        if [[ "${{ inputs.dry-run }}" == "true" ]]; then ARGS+=(--dry-run); fi
-        if [[ "${{ inputs.use-docker-zap }}" == "true" ]]; then ARGS+=(--use-docker-zap); fi
+        if [[ -n "$INPUT_URL" ]]; then ARGS+=(--url "$INPUT_URL"); fi
+        if [[ -n "$INPUT_PORT" ]]; then ARGS+=(--port "$INPUT_PORT"); fi
+        if [[ -n "$INPUT_REPORT_PATH" ]]; then ARGS+=(--report-path "$INPUT_REPORT_PATH"); fi
+        if [[ "$INPUT_FULL_SCAN" == "true" ]]; then ARGS+=(--full-scan); fi
+        if [[ "$INPUT_KEEP_DOCKER" == "true" ]]; then ARGS+=(--keep-docker); fi
+        if [[ "$INPUT_SKIP_INSTALL" == "true" ]]; then ARGS+=(--skip-install); fi
+        if [[ -n "$INPUT_AUTH_USER" ]]; then ARGS+=(--auth-user "$INPUT_AUTH_USER"); fi
+        if [[ -n "$INPUT_AUTH_PASSWORD" ]]; then ARGS+=(--auth-password "$INPUT_AUTH_PASSWORD"); fi
+        if [[ -n "$INPUT_AUTH_URL" ]]; then ARGS+=(--auth-url "$INPUT_AUTH_URL"); fi
+        if [[ -n "$INPUT_AUTH_TOKEN" ]]; then ARGS+=(--auth-token "$INPUT_AUTH_TOKEN"); fi
+        if [[ -n "$INPUT_AUTH_TYPE" ]]; then ARGS+=(--auth-type "$INPUT_AUTH_TYPE"); fi
+        if [[ "$INPUT_AUTO_AUTH" == "true" ]]; then ARGS+=(--auto-auth); fi
+        if [[ -n "$INPUT_SCAN_MODE" && "$INPUT_SCAN_MODE" != "auto" ]]; then ARGS+=(--scan-mode "$INPUT_SCAN_MODE"); fi
+        if [[ "$INPUT_VERBOSE" == "true" ]]; then ARGS+=(--verbose); fi
+        if [[ "$INPUT_DRY_RUN" == "true" ]]; then ARGS+=(--dry-run); fi
+        if [[ "$INPUT_USE_DOCKER_ZAP" == "true" ]]; then ARGS+=(--use-docker-zap); fi
 
-        "${{ github.action_path }}/auto-zap.sh" "${ARGS[@]}" || EXIT_CODE=$?
+        "$ACTION_PATH/auto-zap.sh" "${ARGS[@]}" || EXIT_CODE=$?
 
         # Capture report paths
         REPORT=$(ls zap-report-*.html 2>/dev/null | head -1 || echo "")
@@ -159,25 +177,44 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_PORT: ${{ inputs.port }}
+        INPUT_REPORT_PATH: ${{ inputs.report-path }}
+        INPUT_FULL_SCAN: ${{ inputs.full-scan }}
+        INPUT_KEEP_DOCKER: ${{ inputs.keep-docker }}
+        INPUT_SKIP_INSTALL: ${{ inputs.skip-install }}
+        INPUT_AUTH_USER: ${{ inputs.auth-user }}
+        INPUT_AUTH_PASSWORD: ${{ inputs.auth-password }}
+        INPUT_AUTH_URL: ${{ inputs.auth-url }}
+        INPUT_AUTH_TOKEN: ${{ inputs.auth-token }}
+        INPUT_AUTH_TYPE: ${{ inputs.auth-type }}
+        INPUT_AUTO_AUTH: ${{ inputs.auto-auth }}
+        INPUT_SCAN_MODE: ${{ inputs.scan-mode }}
+        INPUT_VERBOSE: ${{ inputs.verbose }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_USE_DOCKER_ZAP: ${{ inputs.use-docker-zap }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         $scanArgs = @()
-        if ("${{ inputs.url }}") { $scanArgs += @("-Url", "${{ inputs.url }}") }
-        if ("${{ inputs.port }}") { $scanArgs += @("-Port", [int]"${{ inputs.port }}") }
-        if ("${{ inputs.report-path }}") { $scanArgs += @("-ReportPath", "${{ inputs.report-path }}") }
-        if ("${{ inputs.full-scan }}" -eq "true") { $scanArgs += "-FullScan" }
-        if ("${{ inputs.keep-docker }}" -eq "true") { $scanArgs += "-KeepDocker" }
-        if ("${{ inputs.skip-install }}" -eq "true") { $scanArgs += "-SkipInstall" }
-        if ("${{ inputs.auth-user }}") { $scanArgs += @("-AuthUser", "${{ inputs.auth-user }}") }
-        if ("${{ inputs.auth-password }}") { $scanArgs += @("-AuthPassword", "${{ inputs.auth-password }}") }
-        if ("${{ inputs.auth-url }}") { $scanArgs += @("-AuthUrl", "${{ inputs.auth-url }}") }
-        if ("${{ inputs.auth-token }}") { $scanArgs += @("-AuthToken", "${{ inputs.auth-token }}") }
-        if ("${{ inputs.auth-type }}") { $scanArgs += @("-AuthType", "${{ inputs.auth-type }}") }
-        if ("${{ inputs.auto-auth }}" -eq "true") { $scanArgs += "-AutoAuth" }
-        if ("${{ inputs.scan-mode }}" -and "${{ inputs.scan-mode }}" -ne "auto") { $scanArgs += @("-ScanMode", "${{ inputs.scan-mode }}") }
-        if ("${{ inputs.verbose }}" -eq "true") { $scanArgs += "-VerboseLog" }
-        if ("${{ inputs.dry-run }}" -eq "true") { $scanArgs += "-DryRun" }
+        if ($env:INPUT_URL) { $scanArgs += @("-Url", $env:INPUT_URL) }
+        if ($env:INPUT_PORT) { $scanArgs += @("-Port", [int]$env:INPUT_PORT) }
+        if ($env:INPUT_REPORT_PATH) { $scanArgs += @("-ReportPath", $env:INPUT_REPORT_PATH) }
+        if ($env:INPUT_FULL_SCAN -eq "true") { $scanArgs += "-FullScan" }
+        if ($env:INPUT_KEEP_DOCKER -eq "true") { $scanArgs += "-KeepDocker" }
+        if ($env:INPUT_SKIP_INSTALL -eq "true") { $scanArgs += "-SkipInstall" }
+        if ($env:INPUT_AUTH_USER) { $scanArgs += @("-AuthUser", $env:INPUT_AUTH_USER) }
+        if ($env:INPUT_AUTH_PASSWORD) { $scanArgs += @("-AuthPassword", $env:INPUT_AUTH_PASSWORD) }
+        if ($env:INPUT_AUTH_URL) { $scanArgs += @("-AuthUrl", $env:INPUT_AUTH_URL) }
+        if ($env:INPUT_AUTH_TOKEN) { $scanArgs += @("-AuthToken", $env:INPUT_AUTH_TOKEN) }
+        if ($env:INPUT_AUTH_TYPE) { $scanArgs += @("-AuthType", $env:INPUT_AUTH_TYPE) }
+        if ($env:INPUT_AUTO_AUTH -eq "true") { $scanArgs += "-AutoAuth" }
+        if ($env:INPUT_SCAN_MODE -and $env:INPUT_SCAN_MODE -ne "auto") { $scanArgs += @("-ScanMode", $env:INPUT_SCAN_MODE) }
+        if ($env:INPUT_VERBOSE -eq "true") { $scanArgs += "-VerboseLog" }
+        if ($env:INPUT_DRY_RUN -eq "true") { $scanArgs += "-DryRun" }
+        if ($env:INPUT_USE_DOCKER_ZAP -eq "true") { $scanArgs += "-UseDockerZap" }
 
-        & "${{ github.action_path }}/auto-zap.ps1" @scanArgs
+        & "$env:ACTION_PATH/auto-zap.ps1" @scanArgs
 
         # Capture report paths
         $report = Get-ChildItem -Filter "zap-report-*.html" -ErrorAction SilentlyContinue | Select-Object -First 1

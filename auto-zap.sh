@@ -17,6 +17,7 @@ TIMESTAMP=$(date +"%Y-%m-%d_%H%M%S")
 ZAP_MODE=""
 ZAP_PID=""
 ZAP_JAR=""
+ZAP_LOG=""
 ZAP_HOME="${ZAP_HOME:-}"
 DOCKER_AVAILABLE=false
 JAVA_AVAILABLE=false
@@ -76,25 +77,26 @@ log_verbose() { [[ "$VERBOSE_LOG" == "true" ]] && echo -e "${GRAY}[V] $1${NC}" |
 log_dryrun()  { [[ "$DRY_RUN" == "true" ]] && echo -e "\033[0;35m[DRY-RUN] $1${NC}" || true; }
 
 # ---- Parse arguments ----
+require_arg() { if [[ $# -lt 2 || -z "$2" ]]; then echo "Error: $1 requires a value" >&2; exit 1; fi; }
 while [[ $# -gt 0 ]]; do
     # shellcheck disable=SC2034
     case $1 in
-        --url|-u)           URL="$2"; shift 2 ;;
-        --port|-p)          PORT="$2"; PORT_FROM_CLI=true; shift 2 ;;
-        --report-path|-r)   REPORT_PATH="$2"; shift 2 ;;
+        --url|-u)           require_arg "$1" "${2:-}"; URL="$2"; shift 2 ;;
+        --port|-p)          require_arg "$1" "${2:-}"; PORT="$2"; PORT_FROM_CLI=true; shift 2 ;;
+        --report-path|-r)   require_arg "$1" "${2:-}"; REPORT_PATH="$2"; shift 2 ;;
         --full-scan|-f)     FULL_SCAN=true; shift ;;
         --keep-docker|-k)   KEEP_DOCKER=true; shift ;;
         --skip-install|-s)  SKIP_INSTALL=true; shift ;;
-        --auth-user)        AUTH_USER="$2"; shift 2 ;;
-        --auth-password)    AUTH_PASSWORD="$2"; shift 2 ;;
-        --auth-url)         AUTH_URL="$2"; shift 2 ;;
-        --auth-token)       AUTH_TOKEN="$2"; shift 2 ;;
-        --auth-type)        AUTH_TYPE="$2"; shift 2 ;;
+        --auth-user)        require_arg "$1" "${2:-}"; AUTH_USER="$2"; shift 2 ;;
+        --auth-password)    require_arg "$1" "${2:-}"; AUTH_PASSWORD="$2"; shift 2 ;;
+        --auth-url)         require_arg "$1" "${2:-}"; AUTH_URL="$2"; shift 2 ;;
+        --auth-token)       require_arg "$1" "${2:-}"; AUTH_TOKEN="$2"; shift 2 ;;
+        --auth-type)        require_arg "$1" "${2:-}"; AUTH_TYPE="$2"; shift 2 ;;
         --auto-auth|-a)     AUTO_AUTH=true; shift ;;
         --sarif)            SARIF=true; shift ;;
         --dry-run)          DRY_RUN=true; shift ;;
         --verbose|-v)       VERBOSE_LOG=true; shift ;;
-        --scan-mode)        SCAN_MODE="$2"; shift 2 ;;
+        --scan-mode)        require_arg "$1" "${2:-}"; SCAN_MODE="$2"; shift 2 ;;
         --use-docker-zap)   USE_DOCKER_ZAP=true; shift ;;
         --help|-h)
             echo "Usage: auto-zap.sh [options]"
@@ -189,6 +191,9 @@ cleanup() {
 
     # Remove auto-auth temp user if we created one
     remove_temp_user
+
+    # Remove ZAP daemon log file
+    [[ -n "$ZAP_LOG" && -f "$ZAP_LOG" ]] && rm -f "$ZAP_LOG"
 
     log_ok "Cleanup complete."
 }
@@ -324,7 +329,11 @@ install_zap_jar() {
 
     # Check if any cached ZAP install already exists (skip API call)
     local cached_dir cached_jar
-    cached_dir=$(find "$install_dir" -maxdepth 1 -type d -name "ZAP_*" 2>/dev/null | sort -V | tail -1)
+    local vsort="sort -V"
+    if ! echo -e "1.2\n1.10" | sort -V >/dev/null 2>&1; then
+        vsort="sort -t. -k1,1n -k2,2n -k3,3n"
+    fi
+    cached_dir=$(find "$install_dir" -maxdepth 1 -type d -name "ZAP_*" 2>/dev/null | $vsort | tail -1)
     if [[ -n "$cached_dir" && -d "$cached_dir" ]]; then
         cached_jar=$(find "$cached_dir" -maxdepth 1 \( -name "zap-*.jar" -o -name "ZAP_*.jar" \) 2>/dev/null | head -1)
         if [[ -n "$cached_jar" && -f "$cached_jar" ]]; then
@@ -336,8 +345,11 @@ install_zap_jar() {
     fi
 
     log_detail "Downloading latest ZAP from GitHub..."
-    local release_json tag version zip_url zip_path zap_dir
-    release_json=$(curl -sf --max-time 30 "https://api.github.com/repos/zaproxy/zaproxy/releases/latest" 2>/dev/null) || {
+    local release_json tag version zip_url zip_path zap_dir curl_auth_args=()
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        curl_auth_args=(-H "Authorization: token $GITHUB_TOKEN")
+    fi
+    release_json=$(curl -sf --max-time 30 "${curl_auth_args[@]}" "https://api.github.com/repos/zaproxy/zaproxy/releases/latest" 2>/dev/null) || {
         log_warn "Failed to query GitHub API for ZAP releases."
         return 1
     }
@@ -914,7 +926,7 @@ if [[ "$USE_DOCKER_ZAP" == "true" ]]; then
 elif find_local_zap; then
     ZAP_MODE="local"
     log_ok "ZAP mode: Local ($ZAP_JAR)"
-elif install_zap_jar; then
+elif [[ "$DRY_RUN" != "true" ]] && install_zap_jar; then
     ZAP_MODE="local"
     log_ok "ZAP mode: Local (auto-installed: $ZAP_JAR)"
 elif [[ "$DOCKER_AVAILABLE" == "true" ]]; then
@@ -991,6 +1003,25 @@ if [[ -n "$URL" ]]; then
     [[ "$APP_PORT" =~ ^[0-9]+$ ]] || APP_PORT=80
     log_ok "Target: $URL"
     echo ""
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dryrun "=== DRY RUN SUMMARY ==="
+        log_dryrun "Target URL      : $URL"
+        log_dryrun "ZAP mode        : $(if [[ "$ZAP_MODE" == "local" ]]; then echo "Local (${ZAP_JAR:-auto-install})"; else echo "Docker ($ZAP_DOCKER_IMAGE)"; fi)"
+        log_dryrun "Scan mode       : $SCAN_MODE"
+        log_dryrun "Full scan       : $FULL_SCAN"
+        log_dryrun "Auth            : $(if [[ -n "$AUTH_USER" || -n "$AUTH_TOKEN" ]]; then echo 'Yes'; elif [[ "$AUTO_AUTH" == "true" ]]; then echo 'Auto'; else echo 'None'; fi)"
+        log_dryrun ""
+        log_dryrun "Would execute:"
+        log_dryrun "  1. Verify target reachable"
+        log_dryrun "  2. Start ZAP on port $ZAP_API_PORT"
+        log_dryrun "  3. Configure context + technology filter"
+        log_dryrun "  4. Run spider + active vulnerability scan"
+        log_dryrun "  5. Generate reports"
+        log_dryrun "  6. Cleanup all processes"
+        log_ok "Dry run complete. No actions performed."
+        exit 0
+    fi
 
     # Verify target is reachable
     wait_for_url "$URL" 15 "target" || exit 1
@@ -1668,27 +1699,27 @@ if [[ "$ZAP_MODE" == "local" ]]; then
     log_detail "Starting local ZAP: $ZAP_JAR"
 
     # Scale heap: 1g for full scan, 512m for baseline
-    zap_heap="512m"
+    ZAP_HEAP="512m"
     if [[ "$FULL_SCAN" == "true" ]]; then
-        zap_heap="1g"
+        ZAP_HEAP="1g"
     fi
 
-    zap_log="${TMPDIR:-/tmp}/auto-zap-daemon-$$.log"
-    "$JAVA_CMD" -Xms256m -Xmx"$zap_heap" -jar "$ZAP_JAR" \
+    ZAP_LOG=$(mktemp "${TMPDIR:-/tmp}/auto-zap-daemon-XXXXXX.log")
+    "$JAVA_CMD" -Xms256m -Xmx"$ZAP_HEAP" -jar "$ZAP_JAR" \
         -daemon -port "$ZAP_API_PORT" \
         -config api.key="$ZAP_API_KEY" \
-        -config api.addrs.addr.name=.* \
+        -config "api.addrs.addr.name=.*" \
         -config api.addrs.addr.regex=true \
         -config connection.timeoutInSecs=120 \
-        >"$zap_log" 2>&1 &
+        >"$ZAP_LOG" 2>&1 &
     ZAP_PID=$!
-    log_detail "ZAP started (PID $ZAP_PID, log: $zap_log)"
+    log_detail "ZAP started (PID $ZAP_PID, log: $ZAP_LOG)"
 
     # Early-death detection: wait 3s then check if process is still alive
     sleep 3
     if ! kill -0 "$ZAP_PID" 2>/dev/null; then
-        log_err "ZAP process died within 3 seconds. Check log: $zap_log"
-        tail -20 "$zap_log" 2>/dev/null | while IFS= read -r line; do log_detail "  $line"; done
+        log_err "ZAP process died within 3 seconds. Check log: $ZAP_LOG"
+        tail -20 "$ZAP_LOG" 2>/dev/null | while IFS= read -r line; do log_detail "  $line"; done
         exit 1
     fi
 else
@@ -1719,7 +1750,7 @@ else
         "$ZAP_DOCKER_IMAGE" \
         zap.sh -daemon -port "$ZAP_API_PORT" \
         -config api.key="$ZAP_API_KEY" \
-        -config api.addrs.addr.name=.* \
+        -config "api.addrs.addr.name=.*" \
         -config api.addrs.addr.regex=true \
         -config connection.timeoutInSecs=120 >/dev/null || {
         log_err "Failed to start ZAP Docker container."

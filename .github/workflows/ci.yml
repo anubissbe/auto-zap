@@ -24,7 +24,7 @@ jobs:
 
       # ---- Bash linting ----
       - name: ShellCheck (auto-zap.sh)
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@00b27aa7cb85167568cb48a3838b75f4265f2bca # master
         with:
           scandir: '.'
           additional_files: 'auto-zap.sh'
@@ -199,12 +199,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Get cache key
+        id: cache-key
+        shell: bash
+        run: echo "week=$(date +%Y-W%V)" >> "$GITHUB_OUTPUT"
+
       - name: Cache ZAP install
         id: zap-cache
         uses: actions/cache@v5
         with:
           path: ~/.auto-zap/zap
-          key: zap-crossplatform-${{ runner.os }}
+          key: zap-${{ runner.os }}-${{ steps.cache-key.outputs.week }}
+          restore-keys: |
+            zap-${{ runner.os }}-
 
       - name: Install ZAP for local mode
         if: steps.zap-cache.outputs.cache-hit != 'true'
