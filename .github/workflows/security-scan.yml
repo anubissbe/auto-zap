@@ -58,12 +58,15 @@ jobs:
           java-version: '17'
 
       # Run the security scan
+      # On push/PR there is no target app — use dry-run to validate the action.
+      # Real scans run on workflow_dispatch (with a URL) or schedule.
       - name: Run Auto-ZAP security scan
         id: zap-scan
         uses: ./
         with:
           url: ${{ github.event.inputs.target-url || '' }}
           full-scan: ${{ github.event.inputs.full-scan || 'false' }}
+          dry-run: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
         continue-on-error: true
 
       # Upload reports as artifacts
