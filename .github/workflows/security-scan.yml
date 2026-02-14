@@ -88,6 +88,13 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      - name: Upload SARIF to GitHub Advanced Security
+        if: always() && steps.zap-scan.outputs.sarif-path != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.zap-scan.outputs.sarif-path }}
+        continue-on-error: true
+
       # Job summary
       - name: Security scan summary
         if: always()
