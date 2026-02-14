@@ -1295,6 +1295,15 @@ else
         fi
 
     else
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_dryrun "No web application framework detected — nothing to scan."
+            log_dryrun "Checked: package.json, manage.py, requirements.txt, pyproject.toml,"
+            log_dryrun "  *.csproj, pom.xml, build.gradle, Gemfile, go.mod, Cargo.toml,"
+            log_dryrun "  mix.exs, deno.json, bunfig.toml, Dockerfile, index.html"
+            log_dryrun ""
+            log_dryrun "Provide --url to scan an already-running app."
+            exit 0
+        fi
         log_err "Could not detect a web application framework."
         log_detail "Checked: package.json, manage.py, requirements.txt, pyproject.toml,"
         log_detail "  *.csproj, pom.xml, build.gradle, Gemfile, go.mod, Cargo.toml,"
