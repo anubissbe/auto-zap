@@ -356,21 +356,41 @@ Options:
 
 ### Installation
 
-#### Windows Installer (recommended)
+#### Download
 
 Download from the [GitHub Releases](https://github.com/anubissbe/auto-zap/releases/latest) page:
 
 | Download | Description |
 |----------|-------------|
-| [Auto-ZAP-Setup.exe](https://github.com/anubissbe/auto-zap/releases/latest/download/Auto-ZAP-Setup.exe) | Full installer (~112 MB) with bundled ZAP + Java |
+| [Auto-ZAP-Setup.exe](https://github.com/anubissbe/auto-zap/releases/latest/download/Auto-ZAP-Setup.exe) | Windows installer (~118 MB) — installs to Program Files, adds to PATH |
+| [Auto-ZAP-portable.zip](https://github.com/anubissbe/auto-zap/releases/latest/download/Auto-ZAP-v1.6.0-portable.zip) | Portable ZIP (~143 MB) — download, unzip, run. No install needed |
 | [auto-zap.ps1](https://github.com/anubissbe/auto-zap/releases/latest/download/auto-zap.ps1) | Standalone script (requires ZAP + Java separately) |
+| [auto-zap.sh](https://github.com/anubissbe/auto-zap/releases/latest/download/auto-zap.sh) | Standalone bash script for Linux/macOS |
 
-The installer bundles:
-- `auto-zap.ps1` - The scanner script
+All options except the standalone scripts bundle:
 - **OWASP ZAP 2.16.1** - Vulnerability scanner
-- **Eclipse Temurin JRE 17** - Java runtime
+- **Eclipse Temurin JRE 17** - Java runtime (Windows x64)
 
-After installation, `auto-zap.cmd` is available from any directory (added to system PATH).
+#### Windows Installer
+
+After running `Auto-ZAP-Setup.exe`, `auto-zap.cmd` is available from any directory (added to system PATH).
+
+#### Portable ZIP (recommended for CLI use)
+
+No installation required — download, extract, and run:
+
+```powershell
+# Extract and run
+Expand-Archive Auto-ZAP-v1.6.0-portable.zip -DestinationPath .
+cd Auto-ZAP-portable
+.\auto-zap.cmd                              # Via CMD launcher (sets JAVA_HOME automatically)
+.\Invoke-AutoZap.ps1                        # Via PowerShell launcher
+.\auto-zap.ps1 -Url http://localhost:3000   # Direct script usage
+```
+
+The portable bundle includes `auto-zap.cmd` and `Invoke-AutoZap.ps1` launchers that automatically configure `JAVA_HOME` to use the bundled JRE.
+
+Linux/macOS users can use the bundled `auto-zap.sh` from the ZIP but need Java 11+ installed separately (the bundled JRE is Windows x64 only).
 
 #### Manual Installation
 
@@ -427,10 +447,10 @@ cd build
 
 ### Prerequisites
 
-> **Easiest option:** Use the [Windows installer](#windows-installer-recommended) - it bundles ZAP and Java.
+> **Easiest option:** Use the [portable ZIP](#portable-zip-recommended-for-cli-use) or [installer](#windows-installer) - both bundle ZAP and Java.
 
 **Required (one of):**
-- **Auto-ZAP Installer** - Includes everything
+- **Auto-ZAP Portable ZIP** or **Installer** - Includes everything
 - **OWASP ZAP** + **Java 17+** (`winget install ZAP.ZAP && winget install EclipseAdoptium.Temurin.17.JRE`)
 - **Docker** (`winget install Docker.DockerDesktop`)
 
