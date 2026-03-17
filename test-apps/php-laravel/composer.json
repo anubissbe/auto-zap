@@ -1,6 +1,6 @@
 {
   "name": "test/laravel-app",
   "require": {
-    "laravel/framework": "^12.0"
+    "laravel/framework": "^13.0"
   }
 }
