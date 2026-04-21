@@ -2,5 +2,5 @@
   "name": "test-adonisjs",
   "version": "1.0.0",
   "scripts": { "dev": "node ace serve --watch", "start": "node ace serve" },
-  "dependencies": { "@adonisjs/core": "^6.0.0" }
+  "dependencies": { "@adonisjs/core": "^7.3.1" }
 }
