@@ -46,7 +46,7 @@ jobs:
 
       - name: Setup .NET
         if: hashFiles('**/*.csproj', '**/*.sln') != ''
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '8.0.x'
 
